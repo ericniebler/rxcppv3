@@ -32,7 +32,7 @@ struct starter {
     subscription start(Context);
 };
 
-struct receiver {
+struct observer {
     template<class T>
     void next(T);
     template<class E>
@@ -42,10 +42,10 @@ struct receiver {
 
 struct subscriber {
     template<class Context>
-    receiver create(Context);
+    observer create(Context);
 };
 
-struct sender {
+struct observable {
     starter bind(subscriber);
 };
 
@@ -54,11 +54,11 @@ struct lifter {
 };
 
 struct adaptor {
-    sender adapt(sender);
+    observable adapt(observable);
 };
 
 struct terminator {
-    starter terminate(sender);
+    starter terminate(observable);
 };
 
 }
@@ -118,17 +118,27 @@ public:
         });
         if (store->stopped) stop();
     }
+    /// \brief 
     void erase(const subscription& s) const {
         if (s == *this) {std::abort();}
         store->others.erase(s);
     }
+    /// \brief 
     void insert(function<void()> stopper) const {
         store->stoppers.emplace_front(stopper);
         if (store->stopped) stop();
     }
+    /// \brief 
     template<class Payload, class... ArgN>
     state<Payload> make_state(ArgN... argn) const;
+    /// \brief 
     state<> make_state() const;
+    /// \brief 
+    state<> copy_state(const state<>&) const;
+    /// \brief 
+    template<class Payload>
+    state<Payload> copy_state(const state<Payload>&) const;
+    /// \brief 
     void stop() const {
         store->stopped = true;
         {
@@ -160,6 +170,23 @@ bool operator<(const subscription& lhs, const subscription& rhs) {
 }
 
 template<class Payload>
+struct state;
+
+template<>
+struct state<void>
+{
+    subscription lifetime;
+    explicit state(subscription lifetime) 
+        : lifetime(lifetime) {
+    }
+    state(const state&) = default;
+    template<class Payload>
+    state(const state<Payload>& o)
+        : lifetime(o.lifetime) {
+    }
+};
+
+template<class Payload>
 struct state
 {
     subscription lifetime;
@@ -170,13 +197,11 @@ struct state
     Payload& get() const {
         return *p;
     }
+    explicit operator state<>(){
+        return {lifetime};
+    }
 private:
     mutable Payload* p;
-};
-template<>
-struct state<void>
-{
-    subscription lifetime;
 };
 
 template<class Payload, class... ArgN>
@@ -194,6 +219,15 @@ state<Payload> subscription::make_state(ArgN... argn) const {
 state<> subscription::make_state() const {
     auto result = state<>{*this};
     return result;
+}
+
+state<> subscription::copy_state(const state<>&) const{
+    return make_state();
+}
+
+template<class Payload>
+state<Payload> subscription::copy_state(const state<Payload>& o) const{
+    return make_state<Payload>(o.get());
 }
 
 namespace detail {
@@ -225,6 +259,29 @@ using not_subscription = enable_if_t<!subscription_check<std::decay_t<T>>::value
 
 }
 
+template<class Start>
+struct starter;
+
+namespace detail {
+    using start_t = function<subscription(state<>)>;
+}
+template<>
+struct starter<detail::start_t> {
+    detail::start_t s;
+    starter(const starter&) = default;
+    template<class Start>
+    starter(const starter<Start>& s)
+        : s(s.s) {
+    }
+    subscription start(state<> st) const {
+        return s(st);
+    }
+    template<class... TN>
+    starter as_interface() const {
+        return {*this};
+    }
+};
+using starter_interface = starter<detail::start_t>;
 
 template<class Start>
 struct starter {
@@ -232,6 +289,10 @@ struct starter {
     template<class Context>
     subscription start(Context&& c) const {
         return s(forward<Context>(c));
+    }
+    template<class... TN>
+    starter_interface as_interface() const {
+        return {*this};
     }
 };
 template<class Start>
@@ -256,21 +317,21 @@ using not_starter = enable_if_t<!starter_check<decay_t<T>>::value>;
 }
 
 template<class Next, class Error, class Complete, class Delegatee = void>
-struct receiver;
+struct observer;
 
 namespace detail {
     
 template<class T>
-struct receiver_check : public false_type {};
+struct observer_check : public false_type {};
 
 template<class Next, class Error, class Complete, class Delegatee>
-struct receiver_check<receiver<Next, Error, Complete, Delegatee>> : public true_type {};
+struct observer_check<observer<Next, Error, Complete, Delegatee>> : public true_type {};
 
 template<class T>
-using for_receiver = enable_if_t<receiver_check<decay_t<T>>::value>;
+using for_observer = enable_if_t<observer_check<decay_t<T>>::value>;
 
 template<class T>
-using not_receiver = enable_if_t<!receiver_check<decay_t<T>>::value>;
+using not_observer = enable_if_t<!observer_check<decay_t<T>>::value>;
 
 auto report = [](auto&& e, auto&& f, auto&&... args){
     try{f(args...);} catch(...) {e(current_exception());}
@@ -293,7 +354,7 @@ auto end = [](const subscription& lifetime, auto&& f, auto&&... cap) {
 
 struct noop
 {
-    template<class V, class CheckV = not_receiver<V>>
+    template<class V, class CheckV = not_observer<V>>
     void operator()(V&&) const {
     }
     template<class Delegatee, class V>
@@ -302,7 +363,7 @@ struct noop
     }
     inline void operator()() const {
     }
-    template<class Delegatee, class Check = for_receiver<Delegatee>>
+    template<class Delegatee, class Check = for_observer<Delegatee>>
     void operator()(const Delegatee& d) const {
         d.complete();
     }
@@ -312,7 +373,7 @@ struct ignore
     template<class E>
     void operator()(E&&) const {
     }
-    template<class Delegatee, class E, class CheckD = for_receiver<Delegatee>>
+    template<class Delegatee, class E, class CheckD = for_observer<Delegatee>>
     void operator()(const Delegatee& d, E&& e) const {
         d.error(forward<E>(e));
     }
@@ -324,7 +385,7 @@ struct fail
         info("abort! ");
         std::abort();
     }
-    template<class Delegatee, class E, class CheckD = for_receiver<Delegatee>>
+    template<class Delegatee, class E, class CheckD = for_observer<Delegatee>>
     void operator()(const Delegatee&, E&&) const {
         info("abort! ");
         std::abort();
@@ -333,8 +394,67 @@ struct fail
 
 }
 
+namespace detail{
+    template<class V, class E>
+    struct abstract_observer
+    {
+        virtual ~abstract_observer(){}
+        virtual void next(const V&) const = 0;
+        virtual void error(const E&) const = 0;
+        virtual void complete() const = 0;
+    };
+
+    template<class V, class E, class Next, class Error, class Complete, class Delegatee>
+    struct basic_observer : public abstract_observer<V, E> {
+        using value_t = decay_t<V>;
+        using errorvalue_t = decay_t<E>;
+        basic_observer(const observer<Next, Error, Complete, Delegatee>& o)
+            : d(o){
+        }
+        observer<Next, Error, Complete, Delegatee> d;
+        virtual void next(const value_t& v) const {
+            d.next(v);
+        }
+        virtual void error(const errorvalue_t& err) const {
+            d.error(err);
+        }
+        virtual void complete() const {
+            d.complete();
+        }
+    };
+}
+template<class V, class E>
+struct observer<V, E, void, void> {
+    using value_t = decay_t<V>;
+    using errorvalue_t = decay_t<E>;
+    observer(const observer& o) = default;
+    template<class Next, class Error, class Complete, class Delegatee>
+    observer(const observer<Next, Error, Complete, Delegatee>& o)
+        : lifetime(o.lifetime)
+        , d(make_shared<detail::basic_observer<V, E, Next, Error, Complete, Delegatee>>(o)) {
+    }
+    subscription lifetime;
+    shared_ptr<detail::abstract_observer<value_t, errorvalue_t>> d;
+    void next(const value_t& v) const {
+        d->next(v);
+    }
+    void error(const errorvalue_t& err) const {
+        d->error(err);
+    }
+    void complete() const {
+        d->complete();
+    }
+    template<class... TN>
+    observer as_interface() const {
+        return {*this};
+    }
+};
+template<class V, class E>
+using observer_interface = observer<V, E, void, void>;
+
+
 template<class Next, class Error, class Complete>
-struct receiver<Next, Error, Complete, void> {
+struct observer<Next, Error, Complete, void> {
     subscription lifetime;
     Next n;
     Error e;
@@ -353,9 +473,14 @@ struct receiver<Next, Error, Complete, void> {
         using namespace detail;
         report(fail{}, end(lifetime, c));
     }
+    template<class V, class E = exception_ptr>
+    observer_interface<V, E> as_interface() const {
+        using observer_t = detail::basic_observer<V, E, Next, Error, Complete, void>;
+        return {lifetime, make_shared<observer_t>(*this)};
+    }
 };
 template<class Delegatee, class Next, class Error, class Complete>
-struct receiver {
+struct observer {
     Delegatee d;
     subscription lifetime;
     Next n;
@@ -375,12 +500,17 @@ struct receiver {
         using namespace detail;
         report(fail{}, end(lifetime, c), d);
     }
+    template<class V, class E = exception_ptr>
+    observer_interface<V, E> as_interface() const {
+        using observer_t = detail::basic_observer<V, E, Delegatee, Next, Error, Complete>;
+        return {lifetime, make_shared<observer_t>(*this)};
+    }
 };
 
 template<class Next = detail::noop, class Error = detail::fail, class Complete = detail::noop, 
-    class CheckN = detail::not_receiver<Next>>
-auto make_receiver(subscription lifetime, Next&& n = Next{}, Error&& e = Error{}, Complete&& c = Complete{}) {
-    return receiver<decay_t<Next>, decay_t<Error>, decay_t<Complete>, void>{
+    class CheckN = detail::not_observer<Next>>
+auto make_observer(subscription lifetime, Next&& n = Next{}, Error&& e = Error{}, Complete&& c = Complete{}) {
+    return observer<decay_t<Next>, decay_t<Error>, decay_t<Complete>, void>{
         lifetime,
         forward<Next>(n), 
         forward<Error>(e), 
@@ -389,9 +519,9 @@ auto make_receiver(subscription lifetime, Next&& n = Next{}, Error&& e = Error{}
 }
 
 template<class Delegatee, class Next = detail::noop, class Error = detail::fail, class Complete = detail::noop, 
-    class CheckD = detail::for_receiver<Delegatee>>
-auto make_receiver(Delegatee&& d, subscription lifetime, Next&& n = Next{}, Error&& e = Error{}, Complete&& c = Complete{}) {
-    return receiver<decay_t<Delegatee>, decay_t<Next>, decay_t<Error>, decay_t<Complete>>{
+    class CheckD = detail::for_observer<Delegatee>>
+auto make_observer(Delegatee&& d, subscription lifetime, Next&& n = Next{}, Error&& e = Error{}, Complete&& c = Complete{}) {
+    return observer<decay_t<Delegatee>, decay_t<Next>, decay_t<Error>, decay_t<Complete>>{
         forward<Delegatee>(d), 
         lifetime,
         forward<Next>(n), 
@@ -401,12 +531,42 @@ auto make_receiver(Delegatee&& d, subscription lifetime, Next&& n = Next{}, Erro
 }
 
 template<class Create>
+struct subscriber;
+
+namespace detail {
+    template<class V, class E>
+    using create_t = function<observer_interface<V, E>(state<>)>;
+}
+template<class V, class E>
+struct subscriber<detail::create_t<V, E>> {
+    detail::create_t<V, E> c;
+    subscriber(const subscriber&) = default;
+    template<class Create>
+    subscriber(const subscriber<Create>& o)
+        : c(o.c) {
+    }
+    observer_interface<V, E> create(state<> st) const {
+        return c(st);
+    }
+    template<class... TN>
+    subscriber as_interface() const {
+        return {*this};
+    }
+};
+template<class V, class E>
+using subscriber_interface = subscriber<detail::create_t<V, E>>;
+
+template<class Create>
 struct subscriber {
     Create c;
-    /// \brief returns receiver
+    /// \brief returns observer
     template<class Context>
-    auto create(Context& ctx) const {
+    auto create(Context ctx) const {
         return c(ctx);
+    }
+    template<class V, class E = exception_ptr>
+    subscriber_interface<V, E> as_interface() const {
+        return {*this};
     }
 };
 
@@ -416,7 +576,7 @@ subscriber<Create> make_subscriber(Create&& c) {
 }
 
 auto make_subscriber() {
-    return make_subscriber([](auto ctx){return make_receiver(ctx.lifetime);});
+    return make_subscriber([](auto ctx){return make_observer(ctx.lifetime);});
 }
 
 namespace detail {
@@ -436,36 +596,92 @@ using not_subscriber = enable_if_t<!subscriber_check<decay_t<T>>::value>;
 }
 
 template<class Bind>
-struct sender {
+struct observable;
+
+namespace detail {
+    template<class V, class E>
+    using bind_t = function<starter_interface(const subscriber_interface<V, E>&)>;
+}
+template<class V, class E>
+struct observable<detail::bind_t<V, E>> {
+    detail::bind_t<V, E> b;
+    observable(const observable&) = default;
+    template<class Bind>
+    observable(const observable<Bind>& o) 
+        : b(o.b) {
+    } 
+    starter_interface bind(const subscriber_interface<V, E>& s) const {
+        return b(s);
+    }
+    template<class... TN>
+    observable as_interface() const {
+        return {*this};
+    }
+};
+template<class V, class E>
+using observable_interface = observable<detail::bind_t<V, E>>;
+
+template<class Bind>
+struct observable {
     Bind b;
-    /// \brief returns starter
+    /// \brief 
+    /// \returns starter
     template<class Subscriber>
     auto bind(Subscriber&& s) const {
         return b(s);
     }
+    template<class V, class E = exception_ptr>
+    observable_interface<V, E> as_interface() const {
+        return {*this};
+    }
 };
 
 template<class Bind>
-sender<Bind> make_sender(Bind&& b) {
+observable<Bind> make_observable(Bind&& b) {
     return {forward<Bind>(b)};
 }
 
 namespace detail {
 
 template<class T>
-struct sender_check : public false_type {};
+struct observable_check : public false_type {};
 
 template<class Bind>
-struct sender_check<sender<Bind>> : public true_type {};
+struct observable_check<observable<Bind>> : public true_type {};
 
 template<class T>
-using for_sender = enable_if_t<sender_check<decay_t<T>>::value>;
+using for_observable = enable_if_t<observable_check<decay_t<T>>::value>;
 
 template<class T>
-using not_sender = enable_if_t<!sender_check<decay_t<T>>::value>;
+using not_observable = enable_if_t<!observable_check<decay_t<T>>::value>;
 
 }
 
+template<class Lift>
+struct lifter;
+
+namespace detail {
+    template<class VL, class EL, class VR, class ER>
+    using lift_t = function<subscriber_interface<VL, EL>(const subscriber_interface<VR, ER>&)>;
+}
+template<class VL, class EL, class VR, class ER>
+struct lifter<detail::lift_t<VL, EL, VR, ER>> {
+    detail::lift_t<VL, EL, VR, ER> l;
+    lifter(const lifter&) = default;
+    template<class Lift>
+    lifter(const lifter<Lift>& l) 
+        : l(l.l){
+    }
+    subscriber_interface<VL, EL> lift(const subscriber_interface<VR, ER>& s) const {
+        return l(s);
+    }
+    template<class... TN>
+    lifter as_interface() const {
+        return {*this};
+    }
+};
+template<class VL, class EL, class VR, class ER>
+using lifter_interface = lifter<detail::lift_t<VL, EL, VR, ER>>;
 
 template<class Lift>
 struct lifter {
@@ -474,6 +690,10 @@ struct lifter {
     template<class Subscriber>
     auto lift(Subscriber&& s) const {
         return l(forward<Subscriber>(s));
+    }
+    template<class VL, class EL = exception_ptr, class VR = VL, class ER = EL>
+    lifter_interface<VL, EL, VR, ER> as_interface() const {
+        return {*this};
     }
 };
 
@@ -498,14 +718,43 @@ using not_lifter = enable_if_t<!lifter_check<decay_t<T>>::value>;
 
 }
 
+template<class Adapt>
+struct adaptor;
+
+namespace detail {
+    template<class VL, class EL, class VR, class ER>
+    using adapt_t = function<observable_interface<VR, ER>(const observable_interface<VL, EL>&)>;
+}
+template<class VL, class EL, class VR, class ER>
+struct adaptor<detail::adapt_t<VL, EL, VR, ER>> {
+    detail::adapt_t<VL, EL, VR, ER> a;
+    adaptor(const adaptor&) = default;
+    template<class Adapt>
+    adaptor(const adaptor<Adapt>& a)
+        : a(a.a) {
+    }
+    observable_interface<VR, ER> adapt(const observable_interface<VL, EL>& ovr) const {
+        return a(ovr);
+    }
+    template<class... TN>
+    adaptor as_interface() const {
+        return {*this};
+    }
+};
+template<class VL, class EL, class VR, class ER>
+using adaptor_interface = adaptor<detail::adapt_t<VL, EL, VR, ER>>;
 
 template<class Adapt>
 struct adaptor {
     Adapt a;
-    /// \brief returns sender
-    template<class Sender>
-    auto adapt(Sender&& s) const {
-        return a(forward<Sender>(s));
+    /// \brief returns observable
+    template<class Observable>
+    auto adapt(Observable&& s) const {
+        return a(forward<Observable>(s));
+    }
+    template<class VL, class EL = exception_ptr, class VR = VL, class ER = EL>
+    adaptor_interface<VL, EL, VR, ER> as_interface() const {
+        return {*this};
     }
 };
 
@@ -531,12 +780,42 @@ using not_adaptor = enable_if_t<!adaptor_check<decay_t<T>>::value>;
 }
 
 template<class Terminate>
+struct terminator;
+
+namespace detail {
+    template<class V, class E>
+    using terminate_t = function<starter_interface(const observable_interface<V, E>&)>;
+}
+template<class V, class E>
+struct terminator<detail::terminate_t<V, E>> {
+    detail::terminate_t<V, E> t;
+    terminator(const terminator&) = default;
+    template<class Terminate>
+    terminator(const terminator<Terminate>& t) 
+        : t(t.t) {
+    }
+    starter_interface terminate(const observable_interface<V, E>& ovr) const {
+        return t(ovr);
+    }
+    template<class... TN>
+    terminator as_interface() const {
+        return {*this};
+    }
+};
+template<class V, class E>
+using terminator_interface = terminator<detail::terminate_t<V, E>>;
+
+template<class Terminate>
 struct terminator {
     Terminate t;
-    /// \brief returns sender
-    template<class Sender>
-    auto terminate(Sender&& s) const {
-        return t(forward<Sender>(s));
+    /// \brief returns starter
+    template<class Observable>
+    auto terminate(Observable&& s) const {
+        return t(forward<Observable>(s));
+    }
+    template<class V, class E = exception_ptr>
+    terminator_interface<V, E> as_interface() const {
+        return {*this};
     }
 };
 
@@ -572,15 +851,36 @@ auto start(subscription lifetime = subscription{}) {
     return lifetime.template make_state<Payload>();
 }
 
+template<class Payload>
+auto start(const state<Payload>& o) {
+    return o;
+}
+
+template<class Payload>
+auto start(subscription lifetime, const state<Payload>& o) {
+    return lifetime.copy_state(o);
+}
+
 template<class Payload, class... ArgN>
 auto start(subscription lifetime, ArgN&&... an) {
     return lifetime.template make_state<Payload>(forward<ArgN>(an)...);
 }
 
+template<class... TN>
+struct interface_extractor{
+    template<class O>
+    auto extract(O&& o){
+        return o.template as_interface<TN...>();
+    }
+};
+template<class... TN>
+interface_extractor<TN...> as_interface() {
+    return {};
+}
 
 const auto ints = [](auto first, auto last){
     info("new ints");
-    return make_sender([=](auto scrb){
+    return make_observable([=](auto scrb){
         info("ints bound to subscriber");
         return make_starter([=](auto ctx) {
             auto r = scrb.create(ctx);
@@ -599,10 +899,10 @@ const auto copy_if = [](auto pred){
     info("new copy_if");
     return make_lifter([=](auto scbr){
         info("copy_if bound to subscriber");
-        return make_subscriber([=](auto& ctx){
+        return make_subscriber([=](auto ctx){
             info("copy_if bound to context");
             auto r = scbr.create(ctx);
-            return make_receiver(r, ctx.lifetime, [=](auto& r, auto v){
+            return make_observer(r, ctx.lifetime, [=](auto& r, auto v){
                 if (pred(v)) r.next(v);
             });
         });
@@ -613,10 +913,10 @@ const auto transform = [](auto f){
     info("new transform");
     return make_lifter([=](auto scbr){
         info("transform bound to subscriber");
-        return make_subscriber([=](auto& ctx){
+        return make_subscriber([=](auto ctx){
             info("transform bound to context");
             auto r = scbr.create(ctx);
-            return make_receiver(r, ctx.lifetime, [=](auto& r, auto v){
+            return make_observer(r, ctx.lifetime, [=](auto& r, auto v){
                 r.next(f(v));
             });
         });
@@ -627,11 +927,11 @@ const auto last_or_default = [](auto def){
         info("new last_or_default");
     return make_lifter([=](auto scbr){
         info("last_or_default bound to subscriber");
-        return make_subscriber([=](auto& ctx){
+        return make_subscriber([=](auto ctx){
             info("last_or_default bound to context");
             auto r = scbr.create(ctx);
             auto last = ctx.lifetime.template make_state<std::decay_t<decltype(def)>>(def);
-            return make_receiver(r, ctx.lifetime, 
+            return make_observer(r, ctx.lifetime, 
                 [last](auto& r, auto v){
                     last.get() = v;
                 },
@@ -648,14 +948,14 @@ const auto take = [](int n){
     info("new take");
     return make_adaptor([=](auto source){
         info("take bound to source");
-        return make_sender([=](auto scrb){
+        return make_observable([=](auto scrb){
             info("take bound to subscriber");
             return source.bind(
                 make_subscriber([=](auto ctx){
                     info("take bound to context");
                     auto r = scrb.create(ctx);
                     auto remaining = ctx.lifetime.template make_state<int>(n);
-                    return make_receiver(r, ctx.lifetime, 
+                    return make_observer(r, ctx.lifetime, 
                     [remaining](auto& r, auto v){
                         if (remaining.get()-- == 0) {
                             r.complete();
@@ -672,14 +972,12 @@ const auto merge = [](){
     info("new merge");
     return make_adaptor([=](auto source){
         info("merge bound to source");
-        return make_sender([=](auto scrb){
+        return make_observable([=](auto scrb){
             info("merge bound to subscriber");
             return source.bind(
                 make_subscriber([=](auto ctx){
                     info("merge bound to context");
                     
-                    using payload_t = decay_t<decltype(ctx.get())>;
-
                     auto pending = ctx.lifetime.template make_state<set<subscription>>();
                     pending.get().insert(ctx.lifetime);
 
@@ -690,7 +988,7 @@ const auto merge = [](){
                         }
                         info("merge-output stopped");
                     });
-                    auto destctx = destlifetime.template make_state<payload_t>(ctx.get());
+                    auto destctx = destlifetime.copy_state(ctx);
                     auto r = scrb.create(destctx);
 
                     ctx.lifetime.insert([pending, r, l = ctx.lifetime](){
@@ -701,7 +999,7 @@ const auto merge = [](){
                         info("merge-input stopped");
                     });
 
-                    return make_receiver(r, destlifetime, 
+                    return make_observer(r, destlifetime, 
                         [pending, destctx](auto r, auto v){
                             v.bind(
                                 make_subscriber([=](auto ctx){
@@ -714,7 +1012,7 @@ const auto merge = [](){
                                         }
                                         info("merge-nested stopped");
                                     });
-                                    return make_receiver(r, ctx.lifetime, 
+                                    return make_observer(r, ctx.lifetime, 
                                         [pending](auto& r, auto v){
                                             r.next(v);
                                         },
@@ -725,7 +1023,7 @@ const auto merge = [](){
                                             // not complete until all pending streams have stopped
                                         });
                                 })) | 
-                            start<payload_t>(subscription{}, destctx.get());
+                            start(subscription{}, destctx);
                         },
                         [](auto& r, auto e){
                             r.error(e);
@@ -745,10 +1043,10 @@ auto transform_merge(F&& f) {
 
 const auto printto = [](auto& output){
     info("new printto");
-    return make_subscriber([&](auto& ctx) {
+    return make_subscriber([&](auto ctx) {
         info("printto bound to context");
         auto values = ctx.lifetime.template make_state<int>(0);
-        return make_receiver(
+        return make_observer(
             ctx.lifetime,
             [&, values](auto v) {
                 ++values.get();
@@ -760,14 +1058,6 @@ const auto printto = [](auto& output){
             [&, values](){
                 output << values.get() << " values received - done!" << endl;
             });
-    });
-};
-
-const auto ignore = [](){
-    info("new ignore");
-    return make_subscriber([&](auto& ctx) {
-        info("ignore bound to context");
-        return make_receiver(ctx.lifetime);
     });
 };
 
@@ -800,34 +1090,34 @@ auto operator|(LifterL lhs, LifterR rhs) {
 }
 
 /// \brief chain operator overload for
-/// Sender = Sender | Lifter
-/// \param sender
+/// Observable = Observable | Lifter
+/// \param observable
 /// \param lifter
-/// \returns sender
-template<class Sender, class Lifter,
-    class CheckS = detail::for_sender<Sender>,
+/// \returns observable
+template<class Observable, class Lifter,
+    class CheckS = detail::for_observable<Observable>,
     class CheckL = detail::for_lifter<Lifter>, 
     class _5 = void, 
     class _6 = void>
-auto operator|(Sender&& s, Lifter&& l) {
-    return make_sender([=](auto&& scrb){
+auto operator|(Observable&& s, Lifter&& l) {
+    return make_observable([=](auto&& scrb){
         return s.bind(l.lift(forward<decltype(scrb)>(scrb)));
     });
 }
 
 
 /// \brief chain operator overload for
-/// Starter = Sender | Subscriber
-/// \param sender
+/// Starter = Observable | Subscriber
+/// \param observable
 /// \param subscriber
 /// \returns starter
-template<class Sender, class Subscriber,
-    class CheckS = detail::for_sender<Sender>,
+template<class Observable, class Subscriber,
+    class CheckS = detail::for_observable<Observable>,
     class CheckScbr = detail::for_subscriber<Subscriber>, 
     class _5 = void, 
     class _6 = void, 
     class _7 = void>
-auto operator|(Sender&& s, Subscriber&& scbr) {
+auto operator|(Observable&& s, Subscriber&& scbr) {
     return s.bind(forward<Subscriber>(scbr));
 }
 
@@ -883,7 +1173,7 @@ template<class Adapter, class Lifter,
 auto operator|(Adapter&& a, Lifter&& l) {
     return make_adaptor([=](auto source){
         auto s = a.adapt(source);
-        return make_sender([=](auto&& scrb){
+        return make_observable([=](auto&& scrb){
             return s.bind(l.lift(forward<decltype(scrb)>(scrb)));
         });
     });
@@ -906,19 +1196,19 @@ template<class Lifter, class Adapter,
     class _11 = void>
 auto operator|(Lifter&& l, Adapter&& a) {
     return make_adaptor([=](auto source){
-        return a.adapt(make_sender([=](auto&& scrb){
+        return a.adapt(make_observable([=](auto&& scrb){
             return source.bind(l.lift(forward<decltype(scrb)>(scrb)));
         }));
     });
 }
 
 /// \brief chain operator overload for
-/// Sender = Sender | Adaptor
-/// \param sender
+/// Observable = Observable | Adaptor
+/// \param observable
 /// \param adaptor
-/// \returns sender
-template<class Sender, class Adaptor,
-    class CheckS = detail::for_sender<Sender>,
+/// \returns observable
+template<class Observable, class Adaptor,
+    class CheckS = detail::for_observable<Observable>,
     class CheckA = detail::for_adaptor<Adaptor>, 
     class _5 = void, 
     class _6 = void, 
@@ -928,8 +1218,8 @@ template<class Sender, class Adaptor,
     class _10 = void, 
     class _11 = void, 
     class _12 = void>
-auto operator|(Sender&& s, Adaptor&& a) {
-    return a.adapt(forward<Sender>(s));
+auto operator|(Observable&& s, Adaptor&& a) {
+    return a.adapt(forward<Observable>(s));
 }
 
 /// \brief chain operator overload for
@@ -956,12 +1246,12 @@ auto operator|(Adapter&& a, Subscriber&& scrb) {
 }
 
 /// \brief chain operator overload for
-/// starter = Sender | Terminator
-/// \param sender
+/// starter = Observable | Terminator
+/// \param observable
 /// \param terminator
 /// \returns starter
-template<class Sender, class Terminator,
-    class CheckS = detail::for_sender<Sender>,
+template<class Observable, class Terminator,
+    class CheckS = detail::for_observable<Observable>,
     class CheckA = detail::for_terminator<Terminator>, 
     class _5 = void, 
     class _6 = void, 
@@ -973,9 +1263,20 @@ template<class Sender, class Terminator,
     class _12 = void, 
     class _13 = void, 
     class _14 = void>
-auto operator|(Sender&& s, Terminator&& t) {
-    return t.terminate(forward<Sender>(s));
+auto operator|(Observable&& s, Terminator&& t) {
+    return t.terminate(forward<Observable>(s));
 }
+
+/// \brief chain operator overload for
+/// AnyInterface = Any | InterfaceExtractor
+/// \param any_interface
+/// \param interface_extractor
+/// \returns any_interface
+template<class O, class... TN>
+auto operator|(O&& o, interface_extractor<TN...>&& ie) {
+    return ie.extract(forward<O>(o));
+}
+
 
 }
 
@@ -992,16 +1293,24 @@ void designcontext(int first, int last){
     using designcontextdef::merge;
 
     auto lastof3even = copy_if(even) | 
+        as_interface<int>() |
         take(50000000) |
-        last_or_default(42);
+        as_interface<int>() |
+        last_or_default(42) |
+        as_interface<int>();
  
 {
     auto lifetime = ints(0, 2) | 
+        as_interface<int>() |
         transform_merge([=](int){
             return ints(first, last * 100) |
-                lastof3even;
+                as_interface<int>() |
+                lastof3even |
+                as_interface<int>();
         }) |
+        as_interface<int>() |
         printto(cout) |
+        as_interface<int>() |
         start<destruction>();
 
     lifetime.insert([](){info("caller stopped");});
