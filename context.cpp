@@ -1,10 +1,10 @@
 
 // source ~/source/emsdk_portable/emsdk_env.sh
 
-// em++ -std=c++14 --memory-init-file 0 -s ASSERTIONS=2 -s DEMANGLE_SUPPORT=1 -s DISABLE_EXCEPTION_CATCHING=0 -s EXPORTED_FUNCTIONS="['_main', '_reset', '_designcontext']" -O2 context.cpp -o context.js
+// em++ -std=c++14 --memory-init-file 0 -s ASSERTIONS=2 -s DEMANGLE_SUPPORT=1 -s DISABLE_EXCEPTION_CATCHING=0 -s EXPORTED_FUNCTIONS="['_main', '_reset', '_designcontext']" -Iexecutors/include -O2 context.cpp -o context.js
 
 #if EMSCRIPTEN
-#include "emscripten.h"
+#include <emscripten.h>
 #include <emscripten/html5.h>
 #endif
 
@@ -18,7 +18,9 @@
 #include <regex>
 #include <random>
 #include <chrono>
+#include <thread>
 using namespace std;
+using namespace std::chrono;
 using namespace std::literals;
 
 inline string what(exception_ptr ep) {
@@ -62,7 +64,7 @@ struct destruction
 };
 
 #include "common.h"
-#include "designcontext.h"
+#include "rx.h"
 
 int main() {
     //emscripten_set_main_loop(tick, -1, false);

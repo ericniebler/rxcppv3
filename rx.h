@@ -2,23 +2,38 @@
 
 #include <sstream>
 
-namespace designcontextdef {
+namespace rx {
+    
+// based on Walter Brown's void_t proposal
+// http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2014/n3911.pdf
+namespace detail {
+    template<class... TN> struct void_type {typedef void type;};
+}
+template<class... TN>
+using void_t = typename detail::void_type<TN...>::type;
 
 namespace shapes {
 
-template<class Payload = void>
+template<class Payload>
 struct state;
+
+template<class Payload, class Clock>
+struct context;
 
 struct subscription
 {
-    bool is_stopped() const;
-    void insert(const subscription& s) const;
-    void erase(const subscription& s) const;
-    void insert(function<void()> stopper) const;
-    state<> make_state(subscription) const;
+    bool is_stopped();
+    void stop();
+
+    void insert(const subscription& s);
+    void erase(const subscription& s);
+
+    void insert(function<void()> stopper);
+
     template<class Payload, class... ArgN>
-    state<Payload> make_state(subscription, ArgN... argn) const;
-    void stop() const;
+    state<Payload> make_state(ArgN... argn);
+    template<class Payload>
+    state<Payload> copy_state(const state<Payload>&);
 };
 
 template<class Payload>
@@ -28,8 +43,8 @@ struct state {
 };
 
 struct starter {
-    template<class Context>
-    subscription start(Context);
+    template<class Payload, class Clock>
+    subscription start(context<Payload, Clock>);
 };
 
 struct observer {
@@ -41,8 +56,8 @@ struct observer {
 };
 
 struct subscriber {
-    template<class Context>
-    observer create(Context);
+    template<class Payload, class Clock>
+    observer create(context<Payload, Clock>);
 };
 
 struct observable {
@@ -60,6 +75,42 @@ struct adaptor {
 struct terminator {
     starter terminate(observable);
 };
+
+template<class Clock>
+struct strand {
+    subscription lifetime;
+
+    typename Clock::time_point now();
+    void defer_at(typename Clock::time_point, observer);
+};
+
+template<class Clock>
+void defer(strand<Clock>, observer);
+template<class Clock>
+void defer_at(strand<Clock>, typename Clock::time_point, observer);
+template<class Clock>
+void defer_after(strand<Clock>, typename Clock::duration, observer);
+template<class Clock>
+void defer_periodic(strand<Clock>, typename Clock::time_point, typename Clock::duration, observer);
+
+template<class Payload, class Clock>
+struct context {
+    subscription lifetime;
+    
+    typename Clock::time_point now();
+    void defer_at(typename Clock::time_point, observer);
+
+    Payload& get();
+};
+
+template<class Payload, class Clock>
+void defer(context<Payload, Clock>, observer);
+template<class Payload, class Clock>
+void defer_at(context<Payload, Clock>, typename Clock::time_point, observer);
+template<class Payload, class Clock>
+void defer_after(context<Payload, Clock>, typename Clock::duration, observer);
+template<class Payload, class Clock>
+void defer_periodic(context<Payload, Clock>, typename Clock::time_point, typename Clock::duration, observer);
 
 }
 
@@ -169,8 +220,21 @@ bool operator<(const subscription& lhs, const subscription& rhs) {
     return lhs.store < rhs.store;
 }
 
-template<class Payload>
-struct state;
+namespace detail {
+
+template<class T>
+struct subscription_check : public false_type {};
+
+template<>
+struct subscription_check<subscription> : public true_type {};
+
+template<class T>
+using for_subscription = enable_if_t<subscription_check<std::decay_t<T>>::value>;
+
+template<class T>
+using not_subscription = enable_if_t<!subscription_check<std::decay_t<T>>::value>;
+
+}
 
 template<>
 struct state<void>
@@ -230,6 +294,23 @@ state<Payload> subscription::copy_state(const state<Payload>& o) const{
     return make_state<Payload>(o.get());
 }
 
+template<class Payload, class... ArgN>
+state<Payload> make_state(subscription lifetime, ArgN... argn) {
+    return lifetime.template make_state<Payload>(forward<ArgN>(argn)...);
+}
+inline state<> make_state(subscription lifetime) {
+    return lifetime.make_state();
+}
+
+state<> copy_state(subscription lifetime, const state<>&) {
+    return lifetime.make_state();
+}
+
+template<class Payload>
+state<Payload> copy_state(subscription lifetime, const state<Payload>& o) {
+    return lifetime.template make_state<Payload>(o.get());
+}
+
 namespace detail {
 
 template<class T>
@@ -243,76 +324,6 @@ using for_state = enable_if_t<state_check<std::decay_t<T>>::value>;
 
 template<class T>
 using not_state = enable_if_t<!state_check<std::decay_t<T>>::value>;
-
-
-template<class T>
-struct subscription_check : public false_type {};
-
-template<>
-struct subscription_check<subscription> : public true_type {};
-
-template<class T>
-using for_subscription = enable_if_t<subscription_check<std::decay_t<T>>::value>;
-
-template<class T>
-using not_subscription = enable_if_t<!subscription_check<std::decay_t<T>>::value>;
-
-}
-
-template<class Start>
-struct starter;
-
-namespace detail {
-    using start_t = function<subscription(state<>)>;
-}
-template<>
-struct starter<detail::start_t> {
-    detail::start_t s;
-    starter(const starter&) = default;
-    template<class Start>
-    starter(const starter<Start>& s)
-        : s(s.s) {
-    }
-    subscription start(state<> st) const {
-        return s(st);
-    }
-    template<class... TN>
-    starter as_interface() const {
-        return {*this};
-    }
-};
-using starter_interface = starter<detail::start_t>;
-
-template<class Start>
-struct starter {
-    Start s;
-    template<class Context>
-    subscription start(Context&& c) const {
-        return s(forward<Context>(c));
-    }
-    template<class... TN>
-    starter_interface as_interface() const {
-        return {*this};
-    }
-};
-template<class Start>
-starter<Start> make_starter(Start&& s) {
-    return {forward<Start>(s)};
-}
-
-namespace detail {
-
-template<class T>
-struct starter_check : public false_type {};
-
-template<class Start>
-struct starter_check<starter<Start>> : public true_type {};
-
-template<class T>
-using for_starter = enable_if_t<starter_check<decay_t<T>>::value>;
-
-template<class T>
-using not_starter = enable_if_t<!starter_check<decay_t<T>>::value>;
 
 }
 
@@ -456,9 +467,9 @@ using observer_interface = observer<V, E, void, void>;
 template<class Next, class Error, class Complete>
 struct observer<Next, Error, Complete, void> {
     subscription lifetime;
-    Next n;
-    Error e;
-    Complete c;
+    mutable Next n;
+    mutable Error e;
+    mutable Complete c;
     template<class V>
     void next(V&& v) const {
         using namespace detail;
@@ -483,9 +494,9 @@ template<class Delegatee, class Next, class Error, class Complete>
 struct observer {
     Delegatee d;
     subscription lifetime;
-    Next n;
-    Error e;
-    Complete c;
+    mutable Next n;
+    mutable Error e;
+    mutable Complete c;
     template<class V>
     void next(V&& v) const {
         using namespace detail;
@@ -530,42 +541,562 @@ auto make_observer(Delegatee&& d, subscription lifetime, Next&& n = Next{}, Erro
     };
 }
 
+template<class Execute, class Now, class Clock>
+struct strand;
+
+namespace detail {
+    template<class C>
+    using re_defer_at_t = function<void(typename C::time_point)>;
+
+    template<class C, class E>
+    struct abstract_strand
+    {
+        virtual ~abstract_strand(){}
+        virtual typename C::time_point now() const = 0;
+        virtual void defer_at(typename C::time_point, observer_interface<re_defer_at_t<C>, E>) const = 0;
+    };
+
+    template<class C, class E, class Execute, class Now>
+    struct basic_strand : public abstract_strand<C, E> {
+        using clock_t = decay_t<C>;
+        using errorvalue_t = decay_t<E>;
+        basic_strand(const strand<Execute, Now, C>& o)
+            : d(o){
+        }
+        strand<Execute, Now, C> d;
+        virtual typename C::time_point now() const {
+            return d.now();
+        }
+        virtual void defer_at(typename C::time_point at, observer_interface<re_defer_at_t<C>, E> out) const {
+            d.defer_at(at, out);
+        }
+    };
+
+    template<class Clock>
+    struct immediate {
+        subscription lifetime;
+        template<class Next, class Error, class Complete, class Delegatee>
+        void operator()(typename Clock::time_point at, observer<Next, Error, Complete, Delegatee> out) const {
+            auto next = at;
+            bool stop = false;
+            info("immediate::defer_at");
+            while (!stop && !lifetime.is_stopped()) {
+                info("immediate::defer_at sleep_until");
+                this_thread::sleep_until(next);
+                stop = true;
+                info("immediate::defer_at next");
+                out.next([&](typename Clock::time_point at){
+                    info("immediate::defer_at self");
+                    stop = false;
+                    next = at;
+                });
+            }
+            info("immediate::defer_at complete");
+            out.complete();
+        }
+    };
+
+    template<class Clock>
+    struct now {
+        typename Clock::time_point operator()() const {
+            return Clock::now();
+        }
+    };
+}
+
+template<class C, class E>
+struct strand<C, E, void_t<typename C::time_point>> {
+    using clock_t = decay_t<C>;
+    using errorvalue_t = decay_t<E>;
+    strand(const strand& o) = default;
+    template<class Execute, class Now>
+    strand(const strand<Execute, Now, C>& o)
+        : lifetime(o.lifetime)
+        , d(make_shared<detail::basic_strand<C, E, Execute, Now>>(o)) {
+    }
+    subscription lifetime;
+    shared_ptr<detail::abstract_strand<clock_t, errorvalue_t>> d;
+    typename C::time_point now() const {
+        return d->now();
+    }
+    void defer_at(typename C::time_point at, observer_interface<detail::re_defer_at_t<C>, E> out) const {
+        d->defer_at(at, out);
+    }
+    template<class... TN>
+    strand as_interface() const {
+        return {*this};
+    }
+};
+template<class C, class E>
+using strand_interface = strand<C, E, void>;
+
+template<class Execute, class Now, class Clock>
+struct strand {
+    subscription lifetime;
+    Execute e;
+    Now n;
+    typename Clock::time_point now() const {
+        return n();
+    }
+    template<class Next, class Error, class Complete, class Delegatee>
+    void defer_at(typename Clock::time_point at, observer<Next, Error, Complete, Delegatee> out) const {
+        e(at, out);
+    }
+    template<class E = exception_ptr>
+    strand_interface<Clock, E> as_interface() const {
+        using strand_t = detail::basic_strand<Clock, E, Execute, Now>;
+        return {lifetime, make_shared<strand_t>(*this)};
+    }
+};
+
+template<class Clock = steady_clock, class Execute = detail::immediate<Clock>, class Now = detail::now<Clock>>
+auto make_strand(subscription lifetime, Execute&& e = Execute{}, Now&& n = Now{}) {
+    return strand<decay_t<Execute>, decay_t<Now>, Clock>{
+        lifetime,
+        forward<Execute>(e), 
+        forward<Now>(n)
+    };
+}
+
+namespace detail {
+
+template<class T>
+struct strand_check : public false_type {};
+
+template<class Execute, class Now, class Clock>
+struct strand_check<strand<Execute, Now, Clock>> : public true_type {};
+
+template<class T>
+using for_strand = enable_if_t<strand_check<std::decay_t<T>>::value>;
+
+template<class T>
+using not_strand = enable_if_t<!strand_check<std::decay_t<T>>::value>;
+
+}
+
+template<class Execute, class Now, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer(strand<Execute, Now, Clock> s, observer<Next, Error, Complete, Delagatee> out) {
+    s.defer_at(s.now(), out);
+}
+template<class Execute, class Now, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer_at(strand<Execute, Now, Clock> s, typename Clock::time_point at, observer<Next, Error, Complete, Delagatee> out) {
+    s.defer_at(at, out);
+}
+template<class Execute, class Now, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer_after(strand<Execute, Now, Clock> s, typename Clock::duration delay, observer<Next, Error, Complete, Delagatee> out) {
+    s.defer_at(s.now() + delay, out);
+}
+template<class Execute, class Now, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer_periodic(strand<Execute, Now, Clock> s, typename Clock::time_point initial, typename Clock::duration period, observer<Next, Error, Complete, Delagatee> out) {
+    long count = 0;
+    auto target = initial;
+    s.defer_at(initial, make_observer(
+        out, 
+        out.lifetime, 
+        [count, target, period](observer<Next, Error, Complete, Delagatee>& out, auto& self) mutable {
+            if (!out.lifetime.is_stopped()) {
+                out.next(count++);
+                target += period;
+                self(target);
+            }
+        },
+        [](const observer<Next, Error, Complete, Delagatee>& out, exception_ptr ep){
+            return out.error(ep);
+        },
+        [](const observer<Next, Error, Complete, Delagatee>& out){
+            // don't shut down out
+        }));
+}
+
+template<class Payload = void, class MakeStrand = void, class Clock = steady_clock>
+struct context;
+
+namespace detail {
+    template<class C, class E>
+    struct abstract_context : public abstract_strand<C, E>
+    {
+        virtual ~abstract_context(){}
+    };
+
+    template<class C, class E, class MakeStrand>
+    struct basic_context : public abstract_context<C, E> {
+        using clock_t = decay_t<C>;
+        using errorvalue_t = decay_t<E>;
+        basic_context(context<void, MakeStrand, C> o)
+            : d(o){
+        }
+        context<void, MakeStrand, C> d;
+        virtual typename C::time_point now() const {
+            return d.now();
+        }
+        virtual void defer_at(typename C::time_point at, observer_interface<re_defer_at_t<C>, E> out) const {
+            d.defer_at(at, out);
+        }
+    };
+    
+    template<class C, class E>
+    using make_strand_t = function<strand_interface<C, E>(subscription)>;
+
+    template<class Clock>
+    struct make_immediate {
+        auto operator()(subscription lifetime) const {
+            return make_strand<Clock>(lifetime, detail::immediate<Clock>{}, detail::now<Clock>{});
+        }
+    };
+
+}
+template<class C, class E>
+struct context<C, E, void_t<typename C::time_point>> {
+    using clock_t = decay_t<C>;
+    using errorvalue_t = decay_t<E>;
+    context(const context& o) = default;
+    template<class Payload, class MakeStrand, class R = decltype(declval<MakeStrand>()(declval<subscription>()))>
+    context(const context<Payload, MakeStrand, C>& o)
+        : lifetime(o.lifetime)
+        , d(make_shared<detail::basic_context<C, E, MakeStrand>>(o))
+        , m([m = o.m](subscription lifetime){
+            return m(lifetime);
+        }) {
+    }
+    subscription lifetime;
+    shared_ptr<detail::abstract_context<clock_t, errorvalue_t>> d;
+    detail::make_strand_t<C, E> m;
+    typename C::time_point now() const {
+        return d->now();
+    }
+    void defer_at(typename C::time_point at, observer_interface<detail::re_defer_at_t<C>, E> out) const {
+        d->defer_at(at, out);
+    }
+    template<class... TN>
+    context as_interface() const {
+        return {*this};
+    }
+};
+template<class C, class E>
+using context_interface = context<C, E, void>;
+
+template<class Clock>
+struct context<void, void, Clock> {
+    using MakeStrand = detail::make_immediate<Clock>;
+    subscription lifetime;
+    MakeStrand m;
+private:
+    using Strand = decay_t<decltype(declval<MakeStrand>()(declval<subscription>()))>;
+    struct State {
+        explicit State(Strand& s) : s(s) {}
+        Strand s;
+    };
+    state<State> s;    
+public:
+
+    explicit context(subscription lifetime) 
+        : lifetime(lifetime)
+        , m()
+        , s(make_state<State>(lifetime, m(lifetime))) {
+    }
+    context(subscription lifetime, MakeStrand m, Strand s) 
+        : lifetime(lifetime)
+        , m(m)
+        , s(make_state<State>(lifetime, s)) {
+    }
+    typename Clock::time_point now() const {
+        return s.get().s.now();
+    }
+    template<class Next, class Error, class Complete, class Delegatee>
+    void defer_at(typename Clock::time_point at, observer<Next, Error, Complete, Delegatee> out) const {
+        s.get().s.defer_at(at, out);
+    }
+    template<class E = exception_ptr>
+    context_interface<Clock, E> as_interface() const {
+        using context_t = detail::basic_context<Clock, E, MakeStrand>;
+        return {lifetime, make_shared<context_t>(*this)};
+    }
+};
+
+template<class MakeStrand, class Clock>
+struct context<void, MakeStrand, Clock> {
+    subscription lifetime;
+    MakeStrand m;
+
+private:
+    using Strand = decay_t<decltype(declval<MakeStrand>()(declval<subscription>()))>;
+    struct State {
+        State(Strand s) : s(s) {}
+        Strand s;
+    };
+    state<State> s;  
+
+public:
+    context(subscription lifetime, MakeStrand m) 
+        : lifetime(lifetime)
+        , m(m)
+        , s(make_state<State>(lifetime, m(lifetime))) {
+    }
+    context(subscription lifetime, MakeStrand m, Strand s) 
+        : lifetime(lifetime)
+        , m(m)
+        , s(make_state<State>(lifetime, s)) {
+    }
+    typename Clock::time_point now() const {
+        return s.get().s.now();
+    }
+    template<class Next, class Error, class Complete, class Delegatee>
+    void defer_at(typename Clock::time_point at, observer<Next, Error, Complete, Delegatee> out) const {
+        s.get().s.defer_at(at, out);
+    }
+    template<class E = exception_ptr>
+    context_interface<Clock, E> as_interface() const {
+        using context_t = detail::basic_context<Clock, E, MakeStrand>;
+        return {lifetime, make_shared<context_t>(*this)};
+    }  
+};
+
+template<class Payload, class MakeStrand, class Clock>
+struct context {
+    subscription lifetime;
+    MakeStrand m;
+    context(subscription lifetime, Payload p, MakeStrand m) 
+        : lifetime(lifetime)
+        , m(m)
+        , s(make_state<State>(lifetime, m(lifetime), p)) {
+    }
+    typename Clock::time_point now() const {
+        return s.get().s.now();
+    }
+    template<class Next, class Error, class Complete, class Delegatee>
+    void defer_at(typename Clock::time_point at, observer<Next, Error, Complete, Delegatee> out) const {
+        s.get().s.defer_at(at, out);
+    }
+    template<class E = exception_ptr>
+    context_interface<Clock, E> as_interface() const {
+        using context_t = detail::basic_context<Clock, E, MakeStrand>;
+        return {lifetime, make_shared<context_t>(*this)};
+    }
+    Payload& get(){
+        return s.get().p;
+    }
+    const Payload& get() const {
+        return s.get().p;
+    }
+    operator context<void, MakeStrand, Clock> () const {
+        return context<void, MakeStrand, Clock>(lifetime, m, s.get().s);
+    }
+private:
+    using Strand = decay_t<decltype(declval<MakeStrand>()(declval<subscription>()))>;
+    struct State {
+        explicit State(Strand& s, Payload& p) : s(s), p(p) {}
+        Strand s;
+        Payload p;
+    };
+    state<State> s;    
+};
+
+inline auto make_context(subscription lifetime) {
+    return context<void, void, steady_clock>{
+        lifetime
+    };
+}
+
+template<class Clock = steady_clock, class MakeStrand>
+auto make_context(subscription lifetime, MakeStrand&& m) {
+    return context<void, decay_t<MakeStrand>, Clock>{
+        lifetime,
+        forward<MakeStrand>(m) 
+    };
+}
+
+template<class Payload, class... AN>
+auto make_context(subscription lifetime, AN&&... an) {
+    return context<Payload, detail::make_immediate<steady_clock>, steady_clock>{
+        lifetime,
+        Payload(forward<AN>(an)...),
+        detail::make_immediate<steady_clock>{}
+    };
+}
+
+template<class Payload, class Clock, class... AN>
+auto make_context(subscription lifetime, AN&&... an) {
+    return context<Payload, detail::make_immediate<Clock>, Clock>{
+        lifetime,
+        Payload(forward<AN>(an)...),
+        detail::make_immediate<Clock>{}
+    };
+}
+
+template<class Payload, class Clock, class MakeStrand, class... AN>
+auto make_context(subscription lifetime, MakeStrand&& m, AN&&... an) {
+    return context<Payload, decay_t<MakeStrand>, Clock>{
+        lifetime,
+        Payload(forward<AN>(an)...),
+        forward<MakeStrand>(m)
+    };
+}
+
+inline auto copy_context(subscription lifetime, const context<>&) {
+    return make_context(lifetime);
+}
+
+template<class Payload, class MakeStrand, class Clock>
+auto copy_context(subscription lifetime, const context<Payload, MakeStrand, Clock>& o) {
+    return make_context<Payload, Clock>(lifetime, o.m, o.get());
+}
+
+template<class MakeStrand, class Clock>
+auto copy_context(subscription lifetime, const context<void, MakeStrand, Clock>& o) {
+    return make_context<Clock>(lifetime, o.m);
+}
+
+template<class C, class E>
+auto copy_context(subscription lifetime, const context_interface<C, E>& o) {
+    return context_interface<C, E>{
+        context<void, detail::make_strand_t<C, E>, C> {
+            lifetime,
+            o.m
+        }
+    };
+}
+
+namespace detail {
+
+template<class T>
+struct context_check : public false_type {};
+
+template<class Payload, class MakeStrand, class Clock>
+struct context_check<context<Payload, MakeStrand, Clock>> : public true_type {};
+
+template<class T>
+using for_context = enable_if_t<context_check<std::decay_t<T>>::value>;
+
+template<class T>
+using not_context = enable_if_t<!context_check<std::decay_t<T>>::value>;
+
+}
+
+template<class Payload, class MakeStrand, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer(context<Payload, MakeStrand, Clock> s, observer<Next, Error, Complete, Delagatee> out) {
+    s.defer_at(s.now(), out);
+}
+template<class Payload, class MakeStrand, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer_at(context<Payload, MakeStrand, Clock> s, typename Clock::time_point at, observer<Next, Error, Complete, Delagatee> out) {
+    s.defer_at(at, out);
+}
+template<class Payload, class MakeStrand, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer_after(context<Payload, MakeStrand, Clock> s, typename Clock::duration delay, observer<Next, Error, Complete, Delagatee> out) {
+    s.defer_at(s.now() + delay, out);
+}
+template<class Payload, class MakeStrand, class Clock, class Next, class Error, class Complete, class Delagatee>
+void defer_periodic(context<Payload, MakeStrand, Clock> s, typename Clock::time_point initial, typename Clock::duration period, observer<Next, Error, Complete, Delagatee> out) {
+    long count = 0;
+    auto target = initial;
+    s.defer_at(initial, make_observer(
+        out, 
+        out.lifetime, 
+        [count, target, period](const observer<Next, Error, Complete, Delagatee>& out, auto& self) mutable {
+            out.next(count++);
+            target += period;
+            self(target);
+        },
+        [](const observer<Next, Error, Complete, Delagatee>& out, exception_ptr ep){
+            return out.error(ep);
+        },
+        [](const observer<Next, Error, Complete, Delagatee>& out){
+            // don't shut down out
+        }));
+}
+
+template<class Start>
+struct starter;
+
+namespace detail {
+    template<class C, class E>
+    using start_t = function<subscription(context_interface<C, E>)>;
+}
+template<class C, class E>
+struct starter<detail::start_t<C, E>> {
+    detail::start_t<C, E> s;
+    starter(const starter&) = default;
+    template<class Start>
+    starter(const starter<Start>& s)
+        : s(s.s) {
+    }
+    subscription start(context_interface<C, E> ctx) const {
+        return s(move(ctx));
+    }
+    template<class... TN>
+    starter as_interface() const {
+        return {*this};
+    }
+};
+template<class C, class E>
+using starter_interface = starter<detail::start_t<C, E>>;
+
+template<class Start>
+struct starter {
+    Start s;
+    template<class Payload, class MakeStrand, class Clock>
+    subscription start(context<Payload, MakeStrand, Clock> ctx) const {
+        return s(ctx);
+    }
+    template<class C = steady_clock, class E = exception_ptr>
+    starter_interface<C, E> as_interface() const {
+        return {*this};
+    }
+};
+template<class Start>
+starter<Start> make_starter(Start&& s) {
+    return {forward<Start>(s)};
+}
+
+namespace detail {
+
+template<class T>
+struct starter_check : public false_type {};
+
+template<class Start>
+struct starter_check<starter<Start>> : public true_type {};
+
+template<class T>
+using for_starter = enable_if_t<starter_check<decay_t<T>>::value>;
+
+template<class T>
+using not_starter = enable_if_t<!starter_check<decay_t<T>>::value>;
+
+}
+
 template<class Create>
 struct subscriber;
 
 namespace detail {
-    template<class V, class E>
-    using create_t = function<observer_interface<V, E>(state<>)>;
+    template<class V, class C, class E>
+    using create_t = function<observer_interface<V, E>(context_interface<C, E>)>;
 }
-template<class V, class E>
-struct subscriber<detail::create_t<V, E>> {
-    detail::create_t<V, E> c;
+template<class V, class C, class E>
+struct subscriber<detail::create_t<V, C, E>> {
+    detail::create_t<V, C, E> c;
     subscriber(const subscriber&) = default;
     template<class Create>
     subscriber(const subscriber<Create>& o)
         : c(o.c) {
     }
-    observer_interface<V, E> create(state<> st) const {
-        return c(st);
-    }
+    observer_interface<V, E> create(context_interface<C, E> ctx) const;
     template<class... TN>
     subscriber as_interface() const {
         return {*this};
     }
 };
-template<class V, class E>
-using subscriber_interface = subscriber<detail::create_t<V, E>>;
+template<class V, class C, class E>
+using subscriber_interface = subscriber<detail::create_t<V, C, E>>;
 
 template<class Create>
 struct subscriber {
     Create c;
     /// \brief returns observer
-    template<class Context>
-    auto create(Context ctx) const {
+    template<class Payload, class MakeStrand, class Clock>
+    auto create(context<Payload, MakeStrand, Clock> ctx) const {
         return c(ctx);
     }
-    template<class V, class E = exception_ptr>
-    subscriber_interface<V, E> as_interface() const {
+    template<class V, class C = steady_clock, class E = exception_ptr>
+    subscriber_interface<V, C, E> as_interface() const {
         return {*this};
     }
 };
@@ -599,18 +1130,18 @@ template<class Bind>
 struct observable;
 
 namespace detail {
-    template<class V, class E>
-    using bind_t = function<starter_interface(const subscriber_interface<V, E>&)>;
+    template<class V, class C, class E>
+    using bind_t = function<starter_interface<C, E>(const subscriber_interface<V, C, E>&)>;
 }
-template<class V, class E>
-struct observable<detail::bind_t<V, E>> {
-    detail::bind_t<V, E> b;
+template<class V, class C, class E>
+struct observable<detail::bind_t<V, C, E>> {
+    detail::bind_t<V, C, E> b;
     observable(const observable&) = default;
     template<class Bind>
     observable(const observable<Bind>& o) 
         : b(o.b) {
     } 
-    starter_interface bind(const subscriber_interface<V, E>& s) const {
+    starter_interface<C, E> bind(const subscriber_interface<V, C, E>& s) const {
         return b(s);
     }
     template<class... TN>
@@ -618,8 +1149,8 @@ struct observable<detail::bind_t<V, E>> {
         return {*this};
     }
 };
-template<class V, class E>
-using observable_interface = observable<detail::bind_t<V, E>>;
+template<class V, class C, class E>
+using observable_interface = observable<detail::bind_t<V, C, E>>;
 
 template<class Bind>
 struct observable {
@@ -630,8 +1161,8 @@ struct observable {
     auto bind(Subscriber&& s) const {
         return b(s);
     }
-    template<class V, class E = exception_ptr>
-    observable_interface<V, E> as_interface() const {
+    template<class V, class C = steady_clock, class E = exception_ptr>
+    observable_interface<V, C, E> as_interface() const {
         return {*this};
     }
 };
@@ -661,18 +1192,18 @@ template<class Lift>
 struct lifter;
 
 namespace detail {
-    template<class VL, class EL, class VR, class ER>
-    using lift_t = function<subscriber_interface<VL, EL>(const subscriber_interface<VR, ER>&)>;
+    template<class VL, class CL, class EL, class VR, class CR, class ER>
+    using lift_t = function<subscriber_interface<VL, CL, EL>(const subscriber_interface<VR, CR, ER>&)>;
 }
-template<class VL, class EL, class VR, class ER>
-struct lifter<detail::lift_t<VL, EL, VR, ER>> {
-    detail::lift_t<VL, EL, VR, ER> l;
+template<class VL, class CL, class EL, class VR, class CR, class ER>
+struct lifter<detail::lift_t<VL, CL, EL, VR, CR, ER>> {
+    detail::lift_t<VL, CL, EL, VR, CR, ER> l;
     lifter(const lifter&) = default;
     template<class Lift>
     lifter(const lifter<Lift>& l) 
         : l(l.l){
     }
-    subscriber_interface<VL, EL> lift(const subscriber_interface<VR, ER>& s) const {
+    subscriber_interface<VL, CL, EL> lift(const subscriber_interface<VR, CR, ER>& s) const {
         return l(s);
     }
     template<class... TN>
@@ -680,8 +1211,8 @@ struct lifter<detail::lift_t<VL, EL, VR, ER>> {
         return {*this};
     }
 };
-template<class VL, class EL, class VR, class ER>
-using lifter_interface = lifter<detail::lift_t<VL, EL, VR, ER>>;
+template<class VL, class CL, class EL, class VR, class CR, class ER>
+using lifter_interface = lifter<detail::lift_t<VL, CL, EL, VR, CR, ER>>;
 
 template<class Lift>
 struct lifter {
@@ -691,8 +1222,8 @@ struct lifter {
     auto lift(Subscriber&& s) const {
         return l(forward<Subscriber>(s));
     }
-    template<class VL, class EL = exception_ptr, class VR = VL, class ER = EL>
-    lifter_interface<VL, EL, VR, ER> as_interface() const {
+    template<class VL, class CL = steady_clock, class EL = exception_ptr, class VR = VL, class CR = CL, class ER = EL>
+    lifter_interface<VL, CL, EL, VR, CR, ER> as_interface() const {
         return {*this};
     }
 };
@@ -722,18 +1253,18 @@ template<class Adapt>
 struct adaptor;
 
 namespace detail {
-    template<class VL, class EL, class VR, class ER>
-    using adapt_t = function<observable_interface<VR, ER>(const observable_interface<VL, EL>&)>;
+    template<class VL, class CL, class EL, class VR, class CR, class ER>
+    using adapt_t = function<observable_interface<VR, CR, ER>(const observable_interface<VL, CL, EL>&)>;
 }
-template<class VL, class EL, class VR, class ER>
-struct adaptor<detail::adapt_t<VL, EL, VR, ER>> {
-    detail::adapt_t<VL, EL, VR, ER> a;
+template<class VL, class CL, class EL, class VR, class CR, class ER>
+struct adaptor<detail::adapt_t<VL, CL, EL, VR, CR, ER>> {
+    detail::adapt_t<VL, CL, EL, VR, CR, ER> a;
     adaptor(const adaptor&) = default;
     template<class Adapt>
     adaptor(const adaptor<Adapt>& a)
         : a(a.a) {
     }
-    observable_interface<VR, ER> adapt(const observable_interface<VL, EL>& ovr) const {
+    observable_interface<VR, CR, ER> adapt(const observable_interface<VL, CL, EL>& ovr) const {
         return a(ovr);
     }
     template<class... TN>
@@ -741,8 +1272,8 @@ struct adaptor<detail::adapt_t<VL, EL, VR, ER>> {
         return {*this};
     }
 };
-template<class VL, class EL, class VR, class ER>
-using adaptor_interface = adaptor<detail::adapt_t<VL, EL, VR, ER>>;
+template<class VL, class CL, class EL, class VR, class CR, class ER>
+using adaptor_interface = adaptor<detail::adapt_t<VL, CL, EL, VR, CR, ER>>;
 
 template<class Adapt>
 struct adaptor {
@@ -752,8 +1283,8 @@ struct adaptor {
     auto adapt(Observable&& s) const {
         return a(forward<Observable>(s));
     }
-    template<class VL, class EL = exception_ptr, class VR = VL, class ER = EL>
-    adaptor_interface<VL, EL, VR, ER> as_interface() const {
+    template<class VL, class CL = steady_clock, class EL = exception_ptr, class VR = VL, class CR = CL, class ER = EL>
+    adaptor_interface<VL, CL, EL, VR, CR, ER> as_interface() const {
         return {*this};
     }
 };
@@ -783,18 +1314,18 @@ template<class Terminate>
 struct terminator;
 
 namespace detail {
-    template<class V, class E>
-    using terminate_t = function<starter_interface(const observable_interface<V, E>&)>;
+    template<class V, class C, class E>
+    using terminate_t = function<starter_interface<C, E>(const observable_interface<V, C, E>&)>;
 }
-template<class V, class E>
-struct terminator<detail::terminate_t<V, E>> {
-    detail::terminate_t<V, E> t;
+template<class V, class C, class E>
+struct terminator<detail::terminate_t<V, C, E>> {
+    detail::terminate_t<V, C, E> t;
     terminator(const terminator&) = default;
     template<class Terminate>
     terminator(const terminator<Terminate>& t) 
         : t(t.t) {
     }
-    starter_interface terminate(const observable_interface<V, E>& ovr) const {
+    starter_interface<C, E> terminate(const observable_interface<V, C, E>& ovr) const {
         return t(ovr);
     }
     template<class... TN>
@@ -802,8 +1333,8 @@ struct terminator<detail::terminate_t<V, E>> {
         return {*this};
     }
 };
-template<class V, class E>
-using terminator_interface = terminator<detail::terminate_t<V, E>>;
+template<class V, class C, class E>
+using terminator_interface = terminator<detail::terminate_t<V, C, E>>;
 
 template<class Terminate>
 struct terminator {
@@ -813,8 +1344,8 @@ struct terminator {
     auto terminate(Observable&& s) const {
         return t(forward<Observable>(s));
     }
-    template<class V, class E = exception_ptr>
-    terminator_interface<V, E> as_interface() const {
+    template<class V, class C = steady_clock, class E = exception_ptr>
+    terminator_interface<V, C, E> as_interface() const {
         return {*this};
     }
 };
@@ -841,29 +1372,38 @@ using not_terminator = enable_if_t<!terminator_check<decay_t<T>>::value>;
 }
 
 
-
-inline state<> start(subscription lifetime = subscription{}) {
-    return lifetime.make_state();
+inline context<> start(subscription lifetime = subscription{}) {
+    return make_context(lifetime);
 }
 
-template<class Payload>
-auto start(subscription lifetime = subscription{}) {
-    return lifetime.template make_state<Payload>();
-}
-
-template<class Payload>
-auto start(const state<Payload>& o) {
-    return o;
-}
-
-template<class Payload>
-auto start(subscription lifetime, const state<Payload>& o) {
-    return lifetime.copy_state(o);
+template<class Payload, class... AN>
+auto start(AN&&... an) {
+    return make_context<Payload>(subscription{}, forward<AN>(an)...);
 }
 
 template<class Payload, class... ArgN>
 auto start(subscription lifetime, ArgN&&... an) {
-    return lifetime.template make_state<Payload>(forward<ArgN>(an)...);
+    return make_context<Payload>(lifetime, forward<ArgN>(an)...);
+}
+
+template<class Payload, class Clock, class... AN>
+auto start(AN&&... an) {
+    return make_context<Payload, Clock>(subscription{}, forward<AN>(an)...);
+}
+
+template<class Payload, class Clock, class... AN>
+auto start(subscription lifetime, AN&&... an) {
+    return make_context<Payload, Clock>(lifetime, forward<AN>(an)...);
+}
+
+template<class Payload, class MakeStrand, class Clock>
+auto start(const context<Payload, MakeStrand, Clock>& o) {
+    return o;
+}
+
+template<class Payload, class MakeStrand, class Clock>
+auto start(subscription lifetime, const context<Payload, MakeStrand, Clock>& o) {
+    return copy_context(lifetime, o);
 }
 
 template<class... TN>
@@ -877,6 +1417,19 @@ template<class... TN>
 interface_extractor<TN...> as_interface() {
     return {};
 }
+
+const auto intervals = [](auto initial, auto period){
+    info("new intervals");
+    return make_observable([=](auto scrb){
+        info("inttervals bound to subscriber");
+        return make_starter([=](auto ctx) {
+            auto r = scrb.create(ctx);
+            info("intervals started");
+            defer_periodic(ctx, initial, period, r);
+            return ctx.lifetime;
+        });
+    });
+};
 
 const auto ints = [](auto first, auto last){
     info("new ints");
@@ -978,7 +1531,7 @@ const auto merge = [](){
                 make_subscriber([=](auto ctx){
                     info("merge bound to context");
                     
-                    auto pending = ctx.lifetime.template make_state<set<subscription>>();
+                    auto pending = make_state<set<subscription>>(ctx.lifetime);
                     pending.get().insert(ctx.lifetime);
 
                     subscription destlifetime;
@@ -988,7 +1541,7 @@ const auto merge = [](){
                         }
                         info("merge-output stopped");
                     });
-                    auto destctx = destlifetime.copy_state(ctx);
+                    auto destctx = copy_context(destlifetime, ctx);
                     auto r = scrb.create(destctx);
 
                     ctx.lifetime.insert([pending, r, l = ctx.lifetime](){
@@ -1122,19 +1675,19 @@ auto operator|(Observable&& s, Subscriber&& scbr) {
 }
 
 /// \brief chain operator overload for
-/// subscription = Starter | State
+/// subscription = Starter | Context
 /// \param starter
-/// \param state
+/// \param context
 /// \returns subscription
-template<class Starter, class State,
+template<class Starter, class Context,
     class CheckS = detail::for_starter<Starter>,
-    class CheckSt = detail::for_state<State>, 
+    class CheckCtx = detail::for_context<Context>, 
     class _5 = void, 
     class _6 = void, 
     class _7 = void, 
     class _8 = void>
-subscription operator|(Starter&& s, State&& st) {
-    return s.start(forward<State>(st));
+subscription operator|(Starter&& s, Context&& ctx) {
+    return s.start(forward<Context>(ctx));
 }
 
 /// \brief chain operator overload for
@@ -1269,7 +1822,7 @@ auto operator|(Observable&& s, Terminator&& t) {
 
 /// \brief chain operator overload for
 /// AnyInterface = Any | InterfaceExtractor
-/// \param any_interface
+/// \param any
 /// \param interface_extractor
 /// \returns any_interface
 template<class O, class... TN>
@@ -1287,25 +1840,66 @@ extern"C" {
 void designcontext(int first, int last){
     using namespace std::chrono;
 
-    using namespace designcontextdef;
-    using designcontextdef::copy_if;
-    using designcontextdef::transform;
-    using designcontextdef::merge;
+    using namespace rx;
+    using rx::copy_if;
+    using rx::transform;
+    using rx::merge;
+ 
+{
+ cout << "compile-time polymorphism" << endl;
+    auto lastofeven = copy_if(even) | 
+        take(100000000) |
+        last_or_default(42);
 
-    auto lastof3even = copy_if(even) | 
+ auto t0 = high_resolution_clock::now();
+    auto lifetime = ints(0, 2) | 
+        transform_merge([=](int){
+            return ints(first, last * 100) |
+                lastofeven;
+        }) |
+        printto(cout) |
+        start<destruction>();
+
+    lifetime.insert([](){info("caller stopped");});
+
+ auto t1 = high_resolution_clock::now();
+ auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
+ auto sc = ((last * 100) - first) * 3;
+ cout << d / sc << " ms per value\n"; 
+ auto s = d / 1000.0;
+ cout << sc / s << " values per second\n"; 
+}
+
+{
+ cout << "intervals" << endl;
+    auto threeeven = copy_if(even) | 
+        take(3);
+
+    auto lifetime = intervals(steady_clock::now(), 1s) | 
+        threeeven |
+        printto(cout) |
+        start<destruction>();
+
+    lifetime.insert([](){cout << "caller stopped" << endl;});
+}
+
+#if 0
+{
+ cout << "interface polymorphism" << endl;
+    auto lastofeven = copy_if(even) | 
         as_interface<int>() |
-        take(50000000) |
+        take(100000000) |
         as_interface<int>() |
         last_or_default(42) |
         as_interface<int>();
- 
-{
+        
+ auto t0 = high_resolution_clock::now();
     auto lifetime = ints(0, 2) | 
         as_interface<int>() |
         transform_merge([=](int){
             return ints(first, last * 100) |
                 as_interface<int>() |
-                lastof3even |
+                lastofeven |
                 as_interface<int>();
         }) |
         as_interface<int>() |
@@ -1314,7 +1908,14 @@ void designcontext(int first, int last){
         start<destruction>();
 
     lifetime.insert([](){info("caller stopped");});
+ auto t1 = high_resolution_clock::now();
+ auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
+ auto sc = ((last * 100) - first) * 3;
+ cout << d / sc << " ms per value\n"; 
+ auto s = d / 1000.0;
+ cout << sc / s << " values per second\n"; 
 }
+#endif
 
 {
  cout << "for" << endl;
@@ -1341,7 +1942,6 @@ void designcontext(int first, int last){
  cout << sc / s << " subscriptions per second\n"; 
 }
 
-
 {
  cout << "transform | merge" << endl;
  auto t0 = high_resolution_clock::now();
@@ -1356,10 +1956,8 @@ void designcontext(int first, int last){
                     int i = '0' - s[0];
                     return i;
                 });
-//                lastof3even;
         }) |
         merge() |
-//        printto(cout) |
         make_subscriber() |
         start<destruction>();
 
@@ -1387,9 +1985,7 @@ void designcontext(int first, int last){
                     int i = '0' - s[0];
                     return i;
                 });
-//                lastof3even;
         }) |
-//        printto(cout) |
         make_subscriber() |
         start<destruction>();
 
