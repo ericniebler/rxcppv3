@@ -148,10 +148,14 @@ public:
     /// \brief used to exit loops or otherwise stop work scoped to this subscription.
     /// \returns bool - if true do not access any state objects.
     bool is_stopped() const {
-        return store->stopped;
+        return !store || store->stopped;
     }
     /// \brief 
     void insert(const subscription& s) const {
+        if (is_stopped()) {
+            s.stop();
+            return;
+        }
         if (s == *this) {std::abort();}
         // nest
         store->others.insert(s);
@@ -167,21 +171,27 @@ public:
                 that.erase(s);
             }
         });
-        if (store->stopped) stop();
     }
     /// \brief 
     void erase(const subscription& s) const {
+        if (is_stopped()) {
+            return;
+        }
         if (s == *this) {std::abort();}
         store->others.erase(s);
     }
     /// \brief 
     void insert(function<void()> stopper) const {
+        if (is_stopped()) {
+            stopper();
+            return;
+        }
         store->stoppers.emplace_front(stopper);
         if (store->stopped) stop();
     }
     /// \brief 
     template<class Payload, class... ArgN>
-    state<Payload> make_state(ArgN... argn) const;
+    state<Payload> make_state(ArgN&&... argn) const;
     /// \brief 
     state<> make_state() const;
     /// \brief 
@@ -191,15 +201,19 @@ public:
     state<Payload> copy_state(const state<Payload>&) const;
     /// \brief 
     void stop() const {
-        store->stopped = true;
+        if (is_stopped()) {
+            return;
+        }
+        auto st = move(store);
+        st->stopped = true;
         {
-            auto others = std::move(store->others);
+            auto others = std::move(st->others);
             for (auto& o : others) {
                 o.stop();
             }
         }
         {
-            auto stoppers = std::move(store->stoppers);
+            auto stoppers = std::move(st->stoppers);
             for (auto& s : stoppers) {
                 s();
             }
@@ -268,9 +282,18 @@ private:
     mutable Payload* p;
 };
 
+class lifetime_error : public logic_error {
+public:
+  explicit lifetime_error (const string& what_arg) : logic_error(what_arg) {}
+  explicit lifetime_error (const char* what_arg) : logic_error(what_arg) {}
+};
+
 template<class Payload, class... ArgN>
-state<Payload> subscription::make_state(ArgN... argn) const {
-    auto p = make_unique<Payload>(argn...);
+state<Payload> subscription::make_state(ArgN&&... argn) const {
+    if (is_stopped()) {
+        throw lifetime_error("subscription is stopped!");
+    }
+    auto p = make_unique<Payload>(forward<ArgN>(argn)...);
     auto result = state<Payload>{*this, p.get()};
     store->destructors.emplace_front(
         [d=p.release()]() mutable {
@@ -281,16 +304,25 @@ state<Payload> subscription::make_state(ArgN... argn) const {
     return result;
 }
 state<> subscription::make_state() const {
+    if (is_stopped()) {
+        throw lifetime_error("subscription is stopped!");
+    }
     auto result = state<>{*this};
     return result;
 }
 
 state<> subscription::copy_state(const state<>&) const{
+    if (is_stopped()) {
+        throw lifetime_error("subscription is stopped!");
+    }
     return make_state();
 }
 
 template<class Payload>
 state<Payload> subscription::copy_state(const state<Payload>& o) const{
+    if (is_stopped()) {
+        throw lifetime_error("subscription is stopped!");
+    }
     return make_state<Payload>(o.get());
 }
 
@@ -387,6 +419,26 @@ struct ignore
     template<class Delegatee, class E, class CheckD = for_observer<Delegatee>>
     void operator()(const Delegatee& d, E&& e) const {
         d.error(forward<E>(e));
+    }
+};
+struct pass
+{
+    template<class Delegatee, class E, class CheckD = for_observer<Delegatee>>
+    void operator()(const Delegatee& d, E&& e) const {
+        d.error(forward<E>(e));
+    }
+    template<class Delegatee, class Check = for_observer<Delegatee>>
+    void operator()(const Delegatee& d) const {
+        d.complete();
+    }
+};
+struct skip
+{
+    template<class Delegatee, class E, class CheckD = for_observer<Delegatee>>
+    void operator()(const Delegatee& d, E&& e) const {
+    }
+    template<class Delegatee, class Check = for_observer<Delegatee>>
+    void operator()(const Delegatee& d) const {
     }
 };
 struct fail
@@ -529,7 +581,7 @@ auto make_observer(subscription lifetime, Next&& n = Next{}, Error&& e = Error{}
     };
 }
 
-template<class Delegatee, class Next = detail::noop, class Error = detail::fail, class Complete = detail::noop, 
+template<class Delegatee, class Next = detail::noop, class Error = detail::pass, class Complete = detail::pass, 
     class CheckD = detail::for_observer<Delegatee>>
 auto make_observer(Delegatee&& d, subscription lifetime, Next&& n = Next{}, Error&& e = Error{}, Complete&& c = Complete{}) {
     return observer<decay_t<Delegatee>, decay_t<Next>, decay_t<Error>, decay_t<Complete>>{
@@ -699,13 +751,7 @@ void defer_periodic(strand<Execute, Now, Clock> s, typename Clock::time_point in
                 target += period;
                 self(target);
             }
-        },
-        [](const observer<Next, Error, Complete, Delagatee>& out, exception_ptr ep){
-            return out.error(ep);
-        },
-        [](const observer<Next, Error, Complete, Delagatee>& out){
-            // don't shut down out
-        }));
+        }, detail::pass{}, detail::skip{}));
 }
 
 template<class Payload = void, class MakeStrand = void, class Clock = steady_clock>
@@ -737,23 +783,47 @@ namespace detail {
     template<class C, class E>
     using make_strand_t = function<strand_interface<C, E>(subscription)>;
 
-    template<class Clock>
+    template<class Clock = steady_clock>
     struct make_immediate {
         auto operator()(subscription lifetime) const {
-            return make_strand<Clock>(lifetime, detail::immediate<Clock>{}, detail::now<Clock>{});
+            return make_strand<Clock>(lifetime, detail::immediate<Clock>{lifetime}, detail::now<Clock>{});
         }
     };
 
 }
+
 template<class C, class E>
 struct context<C, E, void_t<typename C::time_point>> {
     using clock_t = decay_t<C>;
     using errorvalue_t = decay_t<E>;
     context(const context& o) = default;
+    context(context&& o) = default;
     template<class Payload, class MakeStrand, class R = decltype(declval<MakeStrand>()(declval<subscription>()))>
     context(const context<Payload, MakeStrand, C>& o)
         : lifetime(o.lifetime)
         , d(make_shared<detail::basic_context<C, E, MakeStrand>>(o))
+        , m([m = o.m](subscription lifetime){
+            return m(lifetime);
+        }) {
+    }
+    template<class Payload, class MakeStrand, class R = decltype(declval<MakeStrand>()(declval<subscription>()))>
+    context(context<Payload, MakeStrand, C>&& o)
+        : lifetime(o.lifetime)
+        , d(make_shared<detail::basic_context<C, E, MakeStrand>>(o))
+        , m([m = o.m](subscription lifetime){
+            return m(lifetime);
+        }) {
+    }
+    context(const context<void, void, C>& o)
+        : lifetime(o.lifetime)
+        , d(make_shared<detail::basic_context<C, E, void>>(o))
+        , m([m = o.m](subscription lifetime){
+            return m(lifetime);
+        }) {
+    }
+    context(context<void, void, C>&& o)
+        : lifetime(o.lifetime)
+        , d(make_shared<detail::basic_context<C, E, void>>(o))
         , m([m = o.m](subscription lifetime){
             return m(lifetime);
         }) {
@@ -783,7 +853,8 @@ struct context<void, void, Clock> {
 private:
     using Strand = decay_t<decltype(declval<MakeStrand>()(declval<subscription>()))>;
     struct State {
-        explicit State(Strand& s) : s(s) {}
+        explicit State(Strand&& s) : s(s) {}
+        explicit State(const Strand& s) : s(s) {}
         Strand s;
     };
     state<State> s;    
@@ -792,12 +863,14 @@ public:
     explicit context(subscription lifetime) 
         : lifetime(lifetime)
         , m()
-        , s(make_state<State>(lifetime, m(lifetime))) {
+        , s(make_state<State>(lifetime, m(subscription{}))) {
+        lifetime.insert(s.get().s.lifetime);
     }
     context(subscription lifetime, MakeStrand m, Strand s) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, s)) {
+        lifetime.insert(s.get().s.lifetime);
     }
     typename Clock::time_point now() const {
         return s.get().s.now();
@@ -821,7 +894,8 @@ struct context<void, MakeStrand, Clock> {
 private:
     using Strand = decay_t<decltype(declval<MakeStrand>()(declval<subscription>()))>;
     struct State {
-        State(Strand s) : s(s) {}
+        explicit State(Strand&& s) : s(s) {}
+        explicit State(const Strand& s) : s(s) {}
         Strand s;
     };
     state<State> s;  
@@ -830,12 +904,14 @@ public:
     context(subscription lifetime, MakeStrand m) 
         : lifetime(lifetime)
         , m(m)
-        , s(make_state<State>(lifetime, m(lifetime))) {
+        , s(make_state<State>(lifetime, m(subscription{}))) {
+        lifetime.insert(s.get().s.lifetime);
     }
     context(subscription lifetime, MakeStrand m, Strand s) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, s)) {
+        lifetime.insert(s.get().s.lifetime);
     }
     typename Clock::time_point now() const {
         return s.get().s.now();
@@ -858,7 +934,8 @@ struct context {
     context(subscription lifetime, Payload p, MakeStrand m) 
         : lifetime(lifetime)
         , m(m)
-        , s(make_state<State>(lifetime, m(lifetime), p)) {
+        , s(make_state<State>(lifetime, m(subscription{}), move(p))) {
+        lifetime.insert(s.get().s.lifetime);
     }
     typename Clock::time_point now() const {
         return s.get().s.now();
@@ -884,7 +961,8 @@ struct context {
 private:
     using Strand = decay_t<decltype(declval<MakeStrand>()(declval<subscription>()))>;
     struct State {
-        explicit State(Strand& s, Payload& p) : s(s), p(p) {}
+        State(Strand&& s, Payload&& p) : s(s), p(p) {}
+        State(const Strand& s, const Payload& p) : s(s), p(p) {}
         Strand s;
         Payload p;
     };
@@ -894,14 +972,6 @@ private:
 inline auto make_context(subscription lifetime) {
     return context<void, void, steady_clock>{
         lifetime
-    };
-}
-
-template<class Clock = steady_clock, class MakeStrand>
-auto make_context(subscription lifetime, MakeStrand&& m) {
-    return context<void, decay_t<MakeStrand>, Clock>{
-        lifetime,
-        forward<MakeStrand>(m) 
     };
 }
 
@@ -944,6 +1014,16 @@ auto copy_context(subscription lifetime, const context<Payload, MakeStrand, Cloc
 template<class MakeStrand, class Clock>
 auto copy_context(subscription lifetime, const context<void, MakeStrand, Clock>& o) {
     return make_context<Clock>(lifetime, o.m);
+}
+
+template<class NewMakeStrand, class Payload, class MakeStrand, class Clock>
+auto copy_context(subscription lifetime, NewMakeStrand&& makeStrand, const context<Payload, MakeStrand, Clock>& o) {
+    return make_context<Payload, Clock>(lifetime, forward<NewMakeStrand>(makeStrand), o.get());
+}
+
+template<class NewMakeStrand, class MakeStrand, class Clock>
+auto copy_context(subscription lifetime, NewMakeStrand&& makeStrand, const context<void, MakeStrand, Clock>& o) {
+    return make_context<Clock>(lifetime, forward<NewMakeStrand>(makeStrand));
 }
 
 template<class C, class E>
@@ -995,13 +1075,7 @@ void defer_periodic(context<Payload, MakeStrand, Clock> s, typename Clock::time_
             out.next(count++);
             target += period;
             self(target);
-        },
-        [](const observer<Next, Error, Complete, Delagatee>& out, exception_ptr ep){
-            return out.error(ep);
-        },
-        [](const observer<Next, Error, Complete, Delagatee>& out){
-            // don't shut down out
-        }));
+        }, detail::pass{}, detail::skip{}));
 }
 
 template<class Start>
@@ -1078,7 +1152,9 @@ struct subscriber<detail::create_t<V, C, E>> {
     subscriber(const subscriber<Create>& o)
         : c(o.c) {
     }
-    observer_interface<V, E> create(context_interface<C, E> ctx) const;
+    observer_interface<V, E> create(context_interface<C, E> ctx) const {
+        return c(ctx);
+    }
     template<class... TN>
     subscriber as_interface() const {
         return {*this};
@@ -1373,31 +1449,37 @@ using not_terminator = enable_if_t<!terminator_check<decay_t<T>>::value>;
 
 
 inline context<> start(subscription lifetime = subscription{}) {
+    info("start");
     return make_context(lifetime);
 }
 
 template<class Payload, class... AN>
 auto start(AN&&... an) {
+    info("start payload");
     return make_context<Payload>(subscription{}, forward<AN>(an)...);
 }
 
 template<class Payload, class... ArgN>
 auto start(subscription lifetime, ArgN&&... an) {
+    info("start liftime & payload");
     return make_context<Payload>(lifetime, forward<ArgN>(an)...);
 }
 
 template<class Payload, class Clock, class... AN>
 auto start(AN&&... an) {
+    info("start clock & payload");
     return make_context<Payload, Clock>(subscription{}, forward<AN>(an)...);
 }
 
 template<class Payload, class Clock, class... AN>
 auto start(subscription lifetime, AN&&... an) {
+    info("start liftime & clock & payload");
     return make_context<Payload, Clock>(lifetime, forward<AN>(an)...);
 }
 
 template<class Payload, class MakeStrand, class Clock>
 auto start(const context<Payload, MakeStrand, Clock>& o) {
+    info("start copy");
     return o;
 }
 
@@ -1421,8 +1503,9 @@ interface_extractor<TN...> as_interface() {
 const auto intervals = [](auto initial, auto period){
     info("new intervals");
     return make_observable([=](auto scrb){
-        info("inttervals bound to subscriber");
+        info("intervals bound to subscriber");
         return make_starter([=](auto ctx) {
+            info("intervals bound to context");
             auto r = scrb.create(ctx);
             info("intervals started");
             defer_periodic(ctx, initial, period, r);
@@ -1436,6 +1519,7 @@ const auto ints = [](auto first, auto last){
     return make_observable([=](auto scrb){
         info("ints bound to subscriber");
         return make_starter([=](auto ctx) {
+            info("ints bound to context");
             auto r = scrb.create(ctx);
             info("ints started");
             for(auto i = first;!ctx.lifetime.is_stopped(); ++i){
@@ -1444,6 +1528,72 @@ const auto ints = [](auto first, auto last){
             }
             r.complete();
             return ctx.lifetime;
+        });
+    });
+};
+
+const auto observe_on = [](auto makeStrand){
+    info("new observe_on");
+    return make_lifter([=](auto scbr){
+        info("observe_on bound to subscriber");
+        return make_subscriber([=](auto ctx){
+            info("observe_on bound to context");
+            subscription lifetime;
+            lifetime.insert(ctx.lifetime);
+            auto outcontext = copy_context(lifetime, makeStrand, ctx);
+            auto r = scbr.create(outcontext);
+            return make_observer(r, r.lifetime, 
+                [=](auto& r, auto v){
+                    auto next = make_observer(r, subscription{}, [=](auto& r, auto& self){
+                        r.next(v);
+                    }, detail::pass{}, detail::skip{});
+                    defer(outcontext, next);
+                },
+                [=](auto& r, auto e){
+                    auto error = make_observer(r, subscription{}, [=](auto& r, auto& self){
+                        r.error(e);
+                    }, detail::pass{}, detail::skip{});
+                    defer(outcontext, error);
+                },
+                [=, l = ctx.lifetime](auto& r){
+                    auto complete = make_observer(r, subscription{}, [=](auto& r, auto& self){
+                        r.complete();
+                    }, detail::pass{}, detail::skip{});
+                    defer(outcontext, complete);
+                });
+        });
+    });
+};
+
+const auto delay = [](auto delay){
+    info("new delay");
+    return make_lifter([=](auto scbr){
+        info("delay bound to subscriber");
+        return make_subscriber([=](auto ctx){
+            info("delay bound to context");
+            subscription lifetime;
+            lifetime.insert(ctx.lifetime);
+            auto outcontext = copy_context(lifetime, ctx);
+            auto r = scbr.create(outcontext);
+            return make_observer(r, r.lifetime, 
+                [=](auto& r, auto v){
+                    auto next = make_observer(r, subscription{}, [=](auto& r, auto& self){
+                        r.next(v);
+                    }, detail::pass{}, detail::skip{});
+                    defer_after(outcontext, delay, next);
+                },
+                [=](auto& r, auto e){
+                    auto error = make_observer(r, subscription{}, [=](auto& r, auto& self){
+                        r.error(e);
+                    }, detail::pass{}, detail::skip{});
+                    defer_after(outcontext, delay, error);
+                },
+                [=, l = ctx.lifetime](auto& r){
+                    auto complete = make_observer(r, subscription{}, [=](auto& r, auto& self){
+                        r.complete();
+                    }, detail::pass{}, detail::skip{});
+                    defer_after(outcontext, delay, complete);
+                });
         });
     });
 };
@@ -1844,7 +1994,23 @@ void designcontext(int first, int last){
     using rx::copy_if;
     using rx::transform;
     using rx::merge;
- 
+
+{
+ cout << "intervals" << endl;
+    auto threeeven = copy_if(even) | 
+        take(3) |
+        delay(1s) |
+        observe_on(rx::detail::make_immediate<>{});
+
+    auto lifetime = intervals(steady_clock::now(), 1s) | 
+        threeeven |
+        printto(cout) |
+        start<shared_ptr<destruction>>(make_shared<destruction>());
+
+    lifetime.insert([](){cout << "caller stopped" << endl;});
+}
+
+#if !RX_INFO
 {
  cout << "compile-time polymorphism" << endl;
     auto lastofeven = copy_if(even) | 
@@ -1858,9 +2024,7 @@ void designcontext(int first, int last){
                 lastofeven;
         }) |
         printto(cout) |
-        start<destruction>();
-
-    lifetime.insert([](){info("caller stopped");});
+        start();
 
  auto t1 = high_resolution_clock::now();
  auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
@@ -1870,20 +2034,6 @@ void designcontext(int first, int last){
  cout << sc / s << " values per second\n"; 
 }
 
-{
- cout << "intervals" << endl;
-    auto threeeven = copy_if(even) | 
-        take(3);
-
-    auto lifetime = intervals(steady_clock::now(), 1s) | 
-        threeeven |
-        printto(cout) |
-        start<destruction>();
-
-    lifetime.insert([](){cout << "caller stopped" << endl;});
-}
-
-#if 0
 {
  cout << "interface polymorphism" << endl;
     auto lastofeven = copy_if(even) | 
@@ -1904,10 +2054,9 @@ void designcontext(int first, int last){
         }) |
         as_interface<int>() |
         printto(cout) |
-        as_interface<int>() |
-        start<destruction>();
+        as_interface<>() |
+        start();
 
-    lifetime.insert([](){info("caller stopped");});
  auto t1 = high_resolution_clock::now();
  auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
  auto sc = ((last * 100) - first) * 3;
@@ -1915,7 +2064,6 @@ void designcontext(int first, int last){
  auto s = d / 1000.0;
  cout << sc / s << " values per second\n"; 
 }
-#endif
 
 {
  cout << "for" << endl;
@@ -1930,10 +2078,10 @@ void designcontext(int first, int last){
                 return i;
             }) |
         make_subscriber() |
-        start<destruction>();
+        start();
 
-        lifetime.insert([](){info("caller stopped");});
     }
+
  auto t1 = high_resolution_clock::now();
  auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
  auto sc = last - first;
@@ -1959,9 +2107,7 @@ void designcontext(int first, int last){
         }) |
         merge() |
         make_subscriber() |
-        start<destruction>();
-
-    lifetime.insert([](){info("caller stopped");});
+        start();
 
  auto t1 = high_resolution_clock::now();
  auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
@@ -1987,9 +2133,7 @@ void designcontext(int first, int last){
                 });
         }) |
         make_subscriber() |
-        start<destruction>();
-
-    lifetime.insert([](){info("caller stopped");});
+        start();
 
  auto t1 = high_resolution_clock::now();
  auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
@@ -1998,5 +2142,5 @@ void designcontext(int first, int last){
  auto s = d / 1000.0;
  cout << sc / s << " subscriptions per second\n"; 
 }
-
+#endif
 }

@@ -3,6 +3,8 @@
 
 // em++ -std=c++14 --memory-init-file 0 -s ASSERTIONS=2 -s DEMANGLE_SUPPORT=1 -s DISABLE_EXCEPTION_CATCHING=0 -s EXPORTED_FUNCTIONS="['_main', '_reset', '_designcontext']" -Iexecutors/include -O2 context.cpp -o context.js
 
+// c++ -std=c++14 -DRX_INFO=1 -O2 context.cpp -o context
+
 #if EMSCRIPTEN
 #include <emscripten.h>
 #include <emscripten/html5.h>
@@ -46,7 +48,9 @@ void info(A0 a0, AN... an){
 }
 
 const auto info = [](auto... an){
-//    detail::info(an...);
+#if RX_INFO
+    detail::info(an...);
+#endif
 };
 
 auto even = [](auto v){return (v % 2) == 0;};
@@ -58,8 +62,22 @@ auto always_throw = [](auto... ){
 
 struct destruction
 {
+    bool moved = false;
+    destruction() = default;
+    destruction(const destruction& o) = default;
+    destruction(destruction&& o){
+        o.moved = true;
+    }
+    destruction& operator=(const destruction& o) = default;
+    destruction& operator=(destruction&& o) {
+        o.moved = true;
+        return *this;
+    }
+    
     ~destruction(){
-        info("destructed");
+        if (!moved) {
+            cout << "destructed" << endl;
+        }
     }
 };
 
