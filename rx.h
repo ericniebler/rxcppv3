@@ -384,7 +384,8 @@ state<Payload> subscription::make_state(ArgN&&... argn) const {
     auto p = make_unique<Payload>(forward<ArgN>(argn)...);
     auto result = state<Payload>{*this, p.get()};
     store->destructors.emplace_front(
-        [d=p.release()]() mutable {
+        [d=p.release(), s=store.get()]() mutable {
+            info(to_string(reinterpret_cast<ptrdiff_t>(s)) + " - subscription: destroy make_state " + typeid(Payload).name());
             auto p = d; 
             d = nullptr; 
             delete p;
@@ -1030,12 +1031,24 @@ public:
         , m()
         , s(make_state<State>(lifetime, m(subscription{}))) {
         lifetime.insert(s.get().s.lifetime);
+        auto& ref = s.get();
+        lifetime.bind_defer([&](function<void()> target){
+            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+                return target();
+            }));
+        });
     }
     context(subscription lifetime, make_strand_type m, strand_type strand) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, strand)) {
         lifetime.insert(s.get().s.lifetime);
+        auto& ref = this->s.get();
+        lifetime.bind_defer([&](function<void()> target){
+            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+                return target();
+            }));
+        });
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1073,12 +1086,24 @@ public:
         , m()
         , s(make_state<State>(lifetime, m(subscription{}))) {
         lifetime.insert(s.get().s.lifetime);
+        auto& ref = s.get();
+        lifetime.bind_defer([&](function<void()> target){
+            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+                return target();
+            }));
+        });
     }
     context(subscription lifetime, make_strand_type m, strand_type s) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, s)) {
         lifetime.insert(s.get().s.lifetime);
+        auto& ref = this->s.get();
+        lifetime.bind_defer([&](function<void()> target){
+            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+                return target();
+            }));
+        });
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1117,12 +1142,24 @@ public:
         , m(m)
         , s(make_state<State>(lifetime, m(subscription{}))) {
         lifetime.insert(s.get().s.lifetime);
+        auto& ref = s.get();
+        lifetime.bind_defer([&](function<void()> target){
+            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+                return target();
+            }));
+        });
     }
     context(subscription lifetime, make_strand_type m, strand_type s) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, s)) {
         lifetime.insert(this->s.get().s.lifetime);
+        auto& ref = this->s.get();
+        lifetime.bind_defer([&](function<void()> target){
+            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+                return target();
+            }));
+        });
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1151,6 +1188,12 @@ struct context<Payload, MakeStrand, Clock> {
         , m(m)
         , s(make_state<State>(lifetime, m(subscription{}), move(p))) {
         lifetime.insert(s.get().s.lifetime);
+        auto& ref = s.get();
+        lifetime.bind_defer([&](function<void()> target){
+            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+                return target();
+            }));
+        });
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1220,11 +1263,6 @@ inline auto make_context(subscription lifetime) {
     auto c = context<>{
         lifetime
     };
-    lifetime.bind_defer([c](function<void()> target){
-        defer(c, make_observer(subscription{}, [target](auto& ){
-            return target();
-        }));
-    });
     return c;
 }
 
@@ -1235,11 +1273,6 @@ auto make_context(subscription lifetime, AN&&... an) {
         Payload(forward<AN>(an)...),
         detail::make_immediate<steady_clock>{}
     };
-    lifetime.bind_defer([c](function<void()> target){
-        defer(c, make_observer(subscription{}, [target](auto& ){
-            return target();
-        }));
-    });
     return c;
 }
 
@@ -1250,11 +1283,6 @@ auto make_context(subscription lifetime, AN&&... an) {
         Payload(forward<AN>(an)...),
         detail::make_immediate<Clock>{}
     };
-    lifetime.bind_defer([c](function<void()> target){
-        defer(c, make_observer(subscription{}, [target](auto& ){
-            return target();
-        }));
-    });
     return c;
 }
 
@@ -1265,11 +1293,6 @@ auto make_context(subscription lifetime, MakeStrand&& m, AN&&... an) {
         Payload(forward<AN>(an)...),
         forward<MakeStrand>(m)
     };
-    lifetime.bind_defer([c](function<void()> target){
-        defer(c, make_observer(subscription{}, [target](auto& ){
-            return target();
-        }));
-    });
     return c;
 }
 
@@ -1279,11 +1302,6 @@ auto make_context(subscription lifetime, MakeStrand&& m) {
         lifetime,
         forward<MakeStrand>(m)
     };
-    lifetime.bind_defer([c](function<void()> target){
-        defer(c, make_observer(subscription{}, [target](auto& ){
-            return target();
-        }));
-    });
     return c;
 }
 
@@ -1293,11 +1311,6 @@ auto make_context(subscription lifetime, MakeStrand&& m) {
         lifetime,
         forward<MakeStrand>(m)
     };
-    lifetime.bind_defer([c](function<void()> target){
-        defer(c, make_observer(subscription{}, [target](auto& ){
-            return target();
-        }));
-    });
     return c;
 }
 
@@ -1333,11 +1346,6 @@ auto copy_context(subscription lifetime, const context_interface<C, E>& o) {
             o.m
         }
     };
-    lifetime.bind_defer([c](function<void()> target){
-        defer(c, make_observer(subscription{}, [target](auto& ){
-            return target();
-        }));
-    });
     return c;
 }
 
@@ -2297,7 +2305,7 @@ struct run_loop {
 
     struct guarded_loop {
         ~guarded_loop() {
-            info("guarded_loop: destroy");
+            info(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - run_loop: guarded_loop destroy");
         }
         lock_type lock;
         condition_variable wake;
@@ -2311,49 +2319,55 @@ struct run_loop {
         : lifetime(l)
         , loop(make_state<guarded_loop>(lifetime)) {
         lifetime.insert([loop = this->loop](){
-            info("run_loop: stop notify_all");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: stop notify_all");
+            guard_type guard(loop.get().lock);
             loop.get().wake.notify_all();
         });
     }
     ~run_loop(){
-        info("run_loop: destroy");
+        info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: destroy");
     }
     
     bool is_ready(guard_type& guard) const {
         if (!guard.owns_lock()) { 
-            info("run_loop: is_ready caller must own lock!");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: is_ready caller must own lock!");
             abort(); 
         }
         auto& deferred = loop.get().deferred;
-        return (!deferred.empty() && deferred.top().when <= clock_type::now()) || 
-            loop.lifetime.is_stopped();
+        return !deferred.empty() && deferred.top().when <= clock_type::now();
     }
 
     bool wait(guard_type& guard) const {
         if (!guard.owns_lock()) { 
-            info("run_loop: wait caller must own lock!");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: wait caller must own lock!");
             abort(); 
         }
         auto& deferred = loop.get().deferred;
-        info("run_loop: wait");
-        if (!is_ready(guard)) {
+        info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: wait");
+        if (!loop.lifetime.is_stopped()) {
             if (!deferred.empty()) {
+                info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: wait_until top when");
                 loop.get().wake.wait_until(guard, deferred.top().when, [&](){
-                    return is_ready(guard);
+                    bool r = is_ready(guard) || loop.lifetime.is_stopped();
+                    info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: wait wakeup is_ready - " + to_string(r));
+                    return r;
                 });
             } else {
+                info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: wait for notify");
                 loop.get().wake.wait(guard, [&](){
-                    return is_ready(guard);
+                    bool r = !deferred.empty() || loop.lifetime.is_stopped();
+                    info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: wait wakeup is_ready - " + to_string(r));
+                    return r;
                 });
             }
         }
-        info("run_loop: wake");
+        info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: wake");
         return !loop.lifetime.is_stopped();
     }
 
     void call(guard_type& guard, item_type& next) const {
         if (guard.owns_lock()) { 
-            info("run_loop: call caller must not own lock!");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: call caller must not own lock!");
             abort(); 
         }
         info("run_loop: call");
@@ -2361,27 +2375,27 @@ struct run_loop {
         bool complete = true;
         next.what.next([&](time_point<clock_type> at){
             unique_lock<guard_type> nestedguard(guard);
-            info("run_loop: call self");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: call self");
             if (lifetime.is_stopped() || next.what.lifetime.is_stopped()) return;
-            info("run_loop: call push self");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: call push self");
             next.when = at;
             deferred.push(next);
             complete = false;
         });
         if (complete) {
-            info("run_loop: call complete");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: call complete");
             next.what.complete();
         }
     }
 
     void step(guard_type& guard) const {
         if (!guard.owns_lock()) { 
-            info("run_loop: step caller must own lock!");
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: step caller must own lock!");
             abort(); 
         }
         auto& deferred = loop.get().deferred;
-        while (is_ready(guard)) {
-            info("run_loop: step");
+        while (!loop.lifetime.is_stopped() && is_ready(guard)) {
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: step");
 
             auto next = move(deferred.top());
             deferred.pop();
@@ -2394,11 +2408,11 @@ struct run_loop {
     
     void run() const {
         guard_type guard(loop.get().lock);
-        info("run_loop: run");
+        info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: run");
         while (wait(guard)) {
             step(guard);
         }
-        info("run_loop: exit");
+        info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: exit");
     }
 
     struct strand {
@@ -2411,8 +2425,8 @@ struct run_loop {
             lifetime.insert(out.lifetime);
             out.lifetime.insert([lifetime = this->lifetime, l = out.lifetime](){lifetime.erase(l);});
             loop.get().deferred.push(item_type{at, out});
-            info("run_loop: defer_at notify_one");
-            loop.get().wake.notify_one();
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: defer_at notify_all");
+            loop.get().wake.notify_all();
         }
     };
 
@@ -2432,15 +2446,11 @@ struct threadjoin
     threadjoin(W&& w, N&& n) 
         : worker(forward<W>(w))
         , notify(forward<N>(n)) {
+        worker.detach();
     }
     ~threadjoin(){
-        info("threadjoin: destroy");
-        if (worker.joinable()) {
-            info("threadjoin: notify");
-            notify();
-            info("threadjoin: join");
-            worker.join();
-        }
+        info("threadjoin: destroy notify");
+        notify();
     }
     
 };
@@ -2471,7 +2481,7 @@ struct make_new_thread {
         info("new_thread: create");
         run_loop<Clock, Error> loop(subscription{});
         auto strand = loop.make()(lifetime);
-        auto t = make_state<threadjoin>(lifetime, [=](){loop.run();}, [l = loop.lifetime](){l.stop();});
+        auto t = make_state<threadjoin>(lifetime, [=](){loop.run();}, [l = loop.lifetime](){l.stop(); l.join();});
         return make_strand<Clock>(lifetime, new_thread<decltype(strand)>(move(strand), move(t)), detail::now<Clock>{});
     }
 };
@@ -2480,6 +2490,19 @@ struct make_new_thread {
 
 extern"C" {
     void designcontext(int, int);
+}
+
+auto twointervals(long c) {
+    using namespace std::chrono;
+
+    using namespace rx;
+    using rx::transform;
+
+    auto period = 700ms + (c * 10ms);
+    return intervals(make_new_thread<>{}, steady_clock::now() + period, period) |
+        take(2) |
+        transform([=](long n){return 700 + (c * 10) + n;}) |
+        as_interface<long>();
 }
 
 void designcontext(int first, int last){
@@ -2498,7 +2521,7 @@ auto strand = makeStrand(subscription{});
 
 strand.now();
 
-#if 0
+#if 1
 {
     auto defer_lifetime = subscription{};
     make_state<shared_ptr<destruction>>(defer_lifetime, make_shared<destruction>());
@@ -2552,7 +2575,7 @@ auto makeThread = make_shared_make_strand(make_new_thread<>{});
 
 auto thread = makeThread(subscription{});
 
-#if 0
+#if 1
 
 {
     auto defer_lifetime = subscription{};
@@ -2565,7 +2588,7 @@ this_thread::sleep_for(1s);
 cout << endl;
 #endif
 
-#if 0
+#if 1
 {
     auto defer_lifetime = subscription{};
     make_state<shared_ptr<destruction>>(defer_lifetime, make_shared<destruction>());
@@ -2591,13 +2614,12 @@ cout << endl;
             defer_lifetime.stop();
         }
     })).join();
-    c.lifetime.stop();
 }
 this_thread::sleep_for(2s);
 cout << endl;
 #endif
 
-#if 0
+#if 1
 {
  cout << "intervals" << endl;
     auto threeeven = copy_if(even) | 
@@ -2606,6 +2628,7 @@ cout << endl;
 
     intervals(makeThread, steady_clock::now() + 1s, 1s) | 
         threeeven |
+        as_interface<long>() |
         finally([](){cout << "caller stopped" << endl;}) |
         printto(cout) |
         start<shared_ptr<destruction>>(subscription{}, make_shared<destruction>()) |
@@ -2615,17 +2638,15 @@ this_thread::sleep_for(2s);
 cout << endl;
 #endif
 
-#if 0
+#if 1
 {
  cout << "merged multi-thread intervals" << endl;
-    intervals(makeThread, steady_clock::now() + 1s, 1s) | 
-        take(5) |
-        transform_merge(makeThread, [=](long c){
-            auto period = 700ms + (c * 10ms);
-            return intervals(makeThread, steady_clock::now() + period, period) |
-                take(2) |
-                transform([=](long n){return 700 + (c * 10) + n;});
-        }) |
+
+    // intervals(makeThread, steady_clock::now() + 1s, 1s) | 
+    //     take(5) |
+    //     transform_merge(makeThread, twointervals) |
+    ints(1, 5) |
+        transform_merge(make_new_thread<>{}, twointervals) |
         as_interface<long>() |
         finally([](){cout << "caller stopped" << endl;}) |
         printto(cout) |
