@@ -21,6 +21,9 @@
 #include <random>
 #include <chrono>
 #include <thread>
+#include <sstream>
+#include <future>
+#include <queue>
 using namespace std;
 using namespace std::chrono;
 using namespace std::literals;
@@ -34,6 +37,9 @@ inline string what(exception_ptr ep) {
 }
 
 namespace detail {
+
+mutex infolock;
+const auto start = steady_clock::now();
 
 void info(){
     cout << endl;
@@ -49,7 +55,11 @@ void info(A0 a0, AN... an){
 
 const auto info = [](auto... an){
 #if RX_INFO
+    unique_lock<mutex> guard(detail::infolock);
+    cout << this_thread::get_id() << " - " << duration_cast<milliseconds>(steady_clock::now() - detail::start).count() << "ms - ";
     detail::info(an...);
+#else
+    make_tuple(an...);
 #endif
 };
 
@@ -59,6 +69,10 @@ auto always_throw = [](auto... ){
     throw runtime_error("always throw!");
     return true;
 };
+void use_to_silence_compiler(){
+    always_throw();
+    even(0);
+}
 
 struct destruction
 {
@@ -86,7 +100,7 @@ struct destruction
 
 int main() {
     //emscripten_set_main_loop(tick, -1, false);
-    designcontext(0, 1000000);
+    designcontext(0, 10000);
     return 0;
 }
 
