@@ -11,7 +11,8 @@
 #endif
 
 #include <set>
-#include <deque>
+#include <map>
+#include <list>
 #include <string>
 #include <iostream>
 #include <iomanip>
@@ -63,6 +64,14 @@ const auto info = [](auto... an){
 #endif
 };
 
+const auto output = [](auto... an){
+#if RX_INFO
+    unique_lock<mutex> guard(detail::infolock);
+#endif
+    cout << this_thread::get_id() << " - " << duration_cast<milliseconds>(steady_clock::now() - detail::start).count() << "ms - ";
+    detail::info(an...);
+};
+
 auto even = [](auto v){return (v % 2) == 0;};
 
 auto always_throw = [](auto... ){
@@ -76,23 +85,14 @@ void use_to_silence_compiler(){
 
 struct destruction
 {
-    bool moved = false;
-    destruction() = default;
-    destruction(const destruction& o) = default;
-    destruction(destruction&& o){
-        o.moved = true;
-    }
-    destruction& operator=(const destruction& o) = default;
-    destruction& operator=(destruction&& o) {
-        o.moved = true;
-        return *this;
-    }
-    
-    ~destruction(){
-        if (!moved) {
-            cout << "destructed" << endl;
+    struct Track 
+    {
+        ~Track(){
+            output("destructed");
         }
-    }
+    };
+    shared_ptr<Track> track;
+    destruction() : track(make_shared<Track>()) {}
 };
 
 #include "common.h"
@@ -101,6 +101,9 @@ struct destruction
 int main() {
     //emscripten_set_main_loop(tick, -1, false);
     designcontext(0, 10000);
+    output("main sleep");
+    this_thread::sleep_for(2s);
+    output("main exit");
     return 0;
 }
 

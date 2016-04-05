@@ -148,6 +148,38 @@ using payload_t = typename decay_t<T>::payload_type;
 template<class Payload = void>
 struct state;
 
+using track_list = list<function<void()>>;
+
+recursive_mutex track_lock;
+auto track_f = make_shared<track_list>();
+auto tracked = make_shared<map<void*, track_list::iterator>>();
+
+struct tracker{
+#if 0
+    void erase(void * ) const {}
+    void insert(void * , function<void()> ) const {}
+#else
+    void insert(void * that, function<void()> f) const {
+        unique_lock<recursive_mutex> guard(track_lock);
+        track_f->push_front(f);
+        tracked->insert(make_pair(that, track_f->begin()));
+    }
+    void erase(void * that) const {
+        unique_lock<recursive_mutex> guard(track_lock);
+        track_f->erase((*tracked)[that]);
+        tracked->erase(that);
+    }
+#endif
+    ~tracker(){
+        for(auto& t : *track_f){
+            t();
+        }
+    }
+};
+
+tracker track;
+
+
 ///
 /// \brief A subscription represents the scope of an async operation. 
 /// Holds a set of nested lifetimes. 
@@ -159,71 +191,112 @@ struct subscription
 private:
     using lock_type = mutex;
     using guard_type = unique_lock<lock_type>;
+    struct finish
+    {
+        finish() 
+            : stopped(false)
+            , joined(false) {
+        }
+        lock_type lock;
+        set<subscription> others;
+        atomic<bool> stopped;
+        mutex joinlock;
+        atomic<bool> joined;
+        condition_variable joinwake;
+    };
     struct shared
     {
         ~shared(){
-            info(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - subscription: destroy");
+            info(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - subscription: destroy - " + to_string(destructors.size()));
             {
-                auto expired = std::move(destructors);
+                auto expired = move(destructors);
                 for (auto& d : expired) {
+                    info(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - subscription: destroy destructor");
                     d();
+                    info(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - subscription: destroy destructor exit");
                 }
             }
             info(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - end lifetime");
+            track.erase(this);
         }
-        shared() 
-            : defer([](function<void()> target){target();})
-            , stopped(false) {
+        explicit shared(shared_ptr<finish> signal) 
+            : defer([](function<void()> target){target();}) {
             info(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - new lifetime");
+            track.insert(this, [=](){
+                output(to_string(reinterpret_cast<ptrdiff_t>(this)) + " - leaked lifetime");
+                for (auto& o : signal->others){
+                    output(to_string(reinterpret_cast<ptrdiff_t>(o.store.get())) + " - signal: " + to_string(reinterpret_cast<ptrdiff_t>(o.signal.get())) + " - nested lifetime");
+                }
+                output(to_string(stoppers.size()) + " - leaked stoppers");
+                output(to_string(destructors.size()) + " - leaked destructors");
+            });
         }
-        lock_type lock;
-        mutex joinlock;
-        condition_variable joined;
+        bool search_scopes(shared_ptr<shared> other) {
+            for(auto& check : scopes) {
+                auto scope = check.lock();
+                if (scope == other) {
+                    return true;
+                }
+                if (scope && scope->search_scopes(other)) {
+                    return true;
+                }
+            }
+            return false;
+        }
         function<void(function<void()>)> defer;
-        atomic<bool> stopped;
-        set<subscription> others;
-        deque<function<void()>> stoppers;
-        deque<function<void()>> destructors;
+        list<function<void()>> stoppers;
+        list<function<void()>> destructors;
+        list<weak_ptr<shared>> scopes;
     };
 public:
-    subscription() : store(make_shared<shared>()) {}
-    explicit subscription(shared_ptr<shared> o) : store(o) {}
+    subscription() : signal(make_shared<finish>()), store(make_shared<shared>(signal)) {}
+    subscription(shared_ptr<shared> st, shared_ptr<finish> s) : signal(s), store(st) {}
     /// \brief used to exit loops or otherwise stop work scoped to this subscription.
     /// \returns bool - if true do not access any state objects.
     bool is_stopped() const {
-        if (!store || store->stopped) info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: is_stopped true");
-        else info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: is_stopped false");
-        return !store || store->stopped;
+        return !store || signal->stopped;
     }
     /// \brief 
     void insert(const subscription& s) const {
+        guard_type guard(signal->lock);
         if (is_stopped()) {
             s.stop();
             return;
         }
         if (s == *this) {
-            info("subscription: inserting self!");
+            info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: inserting self!");
             std::abort();
         }
 
-        guard_type guard(store->lock);
+        if (store->search_scopes(s.store)) {
+            info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: inserting loop in lifetime!");
+            std::abort();
+        }
+
         // nest
-        store->others.insert(s);
-        // unnest when child is stopped
+        signal->others.insert(s);
+
         weak_ptr<shared> p = store;
+        s.store->scopes.push_front(p);
+
+        // unnest when child is stopped
         weak_ptr<shared> c = s.store;
-        s.insert([p, c](){
+        s.insert([p, c, ps = signal, cs = s.signal](){
             auto storep = p.lock();
             auto storec = c.lock();
             if (storep && storec) {
-                auto that = subscription(storep);
-                auto s = subscription(storec);
+                //info(to_string(reinterpret_cast<ptrdiff_t>(storep.get())) + " - subscription: erase nested - " + to_string(reinterpret_cast<ptrdiff_t>(storec.get())));
+                auto that = subscription(storep, ps);
+                auto s = subscription(storec, cs);
                 that.erase(s);
+            } else {
+                info("subscription: erase nested (store missing!)");
             }
         });
     }
     /// \brief 
     void erase(const subscription& s) const {
+        guard_type guard(signal->lock);
         if (is_stopped()) {
             return;
         }
@@ -231,20 +304,19 @@ public:
             info("subscription: erasing self!");
             std::abort();
         }
-
-        guard_type guard(store->lock);
-        store->others.erase(s);
+        signal->others.erase(s);
     }
     /// \brief 
     void insert(function<void()> stopper) const {
+        guard_type guard(signal->lock);
+
         if (is_stopped()) {
+            guard.unlock();
             stopper();
             return;
         }
 
-        guard_type guard(store->lock);
         store->stoppers.emplace_front(stopper);
-        if (store->stopped) stop();
     }
     /// \brief 
     template<class Payload, class... ArgN>
@@ -258,59 +330,89 @@ public:
     state<Payload> copy_state(const state<Payload>&) const;
     /// \brief 
     void bind_defer(function<void(function<void()>)> d) {
+        guard_type guard(signal->lock);
         if (is_stopped()) {
             return;
         }
-        guard_type guard(store->lock);
         store->defer = d;
     }
     /// \brief 
     void stop() const {
+        guard_type guard(signal->lock);
         if (is_stopped()) {
             return;
         }
-        guard_type guard(store->lock);
-
-        store->stopped = true;
-        info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: stopped set to true");
-        is_stopped();
 
         auto st = move(store);
-        st->defer([=](){
-            info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: stop");
-            {
-                auto others = std::move(st->others);
-                for (auto& o : others) {
-                    o.stop();
-                    o.join();
-                }
-            }
-            {
-                auto stoppers = std::move(st->stoppers);
-                for (auto& s : stoppers) {
-                    s();
-                }
-            }
-            st->defer = [](function<void()> target){target();};
+        store = nullptr;
 
-            info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: notify");
-            unique_lock<mutex> guard(st->joinlock);
-            st->joined.notify_all();
-            info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: stopped");
+        signal->stopped = true;
+        info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: stopped set to true");
+
+        auto si = signal;
+
+        guard.unlock();
+
+        st->defer([=](){
+            info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: stop");
+
+            {
+                guard_type guard(si->lock);
+                auto expired = st->stoppers;
+                guard.unlock();
+                for (auto s : expired) {
+                    info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: stop stopper");
+                    s();
+                    info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: stop stopper exit");
+                }
+            }
+            {
+                guard_type guard(si->lock);
+                auto expired = si->others;
+                guard.unlock();
+                for (auto o : expired) {
+                    info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: stop other");
+                    o.stop();
+                    info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: stop other exit");
+                }
+            }
+            {
+                guard_type guard(si->lock);
+                st->defer = [](function<void()> target){target();};
+                st->stoppers.clear();
+            }
+
+            info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: notify_all");
+            {
+                unique_lock<mutex> guard(si->joinlock);
+                si->joined = true;
+            }
+            si->joinwake.notify_all();
+            info(to_string(reinterpret_cast<ptrdiff_t>(st.get())) + " - subscription: stopped");
         });
     }
     /// \brief
     void join() const {
-        if (is_stopped()) {
-            return;
-        }
         info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: join");
-        unique_lock<mutex> guard(store->joinlock);
-        store->joined.wait(guard, [st = this->store](){return !!st->stopped;});
-        info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: joined");
+        {
+            unique_lock<mutex> guard(signal->lock);
+            auto expired = signal->others;
+            guard.unlock();
+            for (auto o : expired) {
+                info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: join other");
+                o.join();
+                info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: join other exit");
+            }
+        }
+        {
+            unique_lock<mutex> guard(signal->joinlock);
+            signal->joinwake.wait(guard, [s = this->signal](){return !!s->joined;});
+        }
+        info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: joined " + (signal->joined ? "true" : "false"));
     }
+    shared_ptr<finish> signal;
+    mutable shared_ptr<shared> store;
 private:
-    shared_ptr<shared> store;
     friend bool operator==(const subscription&, const subscription&);
     friend bool operator<(const subscription&, const subscription&);
 };
@@ -376,19 +478,21 @@ public:
 
 template<class Payload, class... ArgN>
 state<Payload> subscription::make_state(ArgN&&... argn) const {
-    info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: make_state " + typeid(Payload).name());
+    guard_type guard(signal->lock);
+    auto size = store->destructors.size();
+    info(to_string(reinterpret_cast<ptrdiff_t>(store.get())) + " - subscription: make_state - " + to_string(size) + " " + typeid(Payload).name());
     if (is_stopped()) {
         throw lifetime_error("subscription is stopped!");
     }
-    guard_type guard(store->lock);
     auto p = make_unique<Payload>(forward<ArgN>(argn)...);
     auto result = state<Payload>{*this, p.get()};
     store->destructors.emplace_front(
-        [d=p.release(), s=store.get()]() mutable {
-            info(to_string(reinterpret_cast<ptrdiff_t>(s)) + " - subscription: destroy make_state " + typeid(Payload).name());
+        [d=p.release(), s=store.get(), size]() mutable {
+            info(to_string(reinterpret_cast<ptrdiff_t>(s)) + " - subscription: destroy make_state - " + to_string(size) + " " + typeid(Payload).name());
             auto p = d; 
             d = nullptr; 
             delete p;
+            info(to_string(reinterpret_cast<ptrdiff_t>(s)) + " - subscription: destroy make_state exit - " + to_string(size) + " " + typeid(Payload).name());
         });
     return result;
 }
@@ -823,8 +927,6 @@ struct shared_strand {
     ~shared_strand() {
         info("shared_strand: destroy stop");
         st.lifetime.stop();
-        info("shared_strand: destroy join");
-        st.lifetime.join();
     }
 };
 
@@ -834,16 +936,9 @@ struct shared_strand_maker {
     shared_ptr<shared_strand<strand_type>> ss;
     auto operator()(subscription lifetime) const {
         ss->st.lifetime.insert(lifetime);
-        lifetime.insert([lifetime, l = ss->st.lifetime](){
-            info("shared_strand_maker: erase");
-            l.erase(lifetime);
-        });
         return make_strand<clock_t<strand_type>>(lifetime, 
             [ss = this->ss, lifetime](auto at, auto o){
                 lifetime.insert(o.lifetime);
-                o.lifetime.insert([lifetime = o.lifetime, l = lifetime](){
-                    l.erase(lifetime);
-                });
                 ss->st.defer_at(at, o);
             },
             [ss = this->ss](){return ss->st.now();});
@@ -1031,24 +1126,28 @@ public:
         , m()
         , s(make_state<State>(lifetime, m(subscription{}))) {
         lifetime.insert(s.get().s.lifetime);
-        auto& ref = s.get();
-        lifetime.bind_defer([&](function<void()> target){
-            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+#if !RX_DEFER_IMMEDIATE
+        lifetime.bind_defer([s = s.get().s](function<void()> target){
+            if (s.lifetime.is_stopped()) abort();
+            defer(s, make_observer(subscription{}, [target](auto& ){
                 return target();
             }));
         });
+#endif
     }
     context(subscription lifetime, make_strand_type m, strand_type strand) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, strand)) {
         lifetime.insert(s.get().s.lifetime);
-        auto& ref = this->s.get();
-        lifetime.bind_defer([&](function<void()> target){
-            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+#if !RX_DEFER_IMMEDIATE
+        lifetime.bind_defer([s = s.get().s](function<void()> target){
+            if (s.lifetime.is_stopped()) abort();
+            defer(s, make_observer(subscription{}, [target](auto& ){
                 return target();
             }));
         });
+#endif
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1086,24 +1185,28 @@ public:
         , m()
         , s(make_state<State>(lifetime, m(subscription{}))) {
         lifetime.insert(s.get().s.lifetime);
-        auto& ref = s.get();
-        lifetime.bind_defer([&](function<void()> target){
-            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+#if !RX_DEFER_IMMEDIATE
+        lifetime.bind_defer([s = s.get().s](function<void()> target){
+            if (s.lifetime.is_stopped()) abort();
+            defer(s, make_observer(subscription{}, [target](auto& ){
                 return target();
             }));
         });
+#endif
     }
     context(subscription lifetime, make_strand_type m, strand_type s) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, s)) {
         lifetime.insert(s.get().s.lifetime);
-        auto& ref = this->s.get();
-        lifetime.bind_defer([&](function<void()> target){
-            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+#if !RX_DEFER_IMMEDIATE
+        lifetime.bind_defer([s = s.get().s](function<void()> target){
+            if (s.lifetime.is_stopped()) abort();
+            defer(s, make_observer(subscription{}, [target](auto& ){
                 return target();
             }));
         });
+#endif
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1142,24 +1245,28 @@ public:
         , m(m)
         , s(make_state<State>(lifetime, m(subscription{}))) {
         lifetime.insert(s.get().s.lifetime);
-        auto& ref = s.get();
-        lifetime.bind_defer([&](function<void()> target){
-            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+#if !RX_DEFER_IMMEDIATE
+        lifetime.bind_defer([s = s.get().s](function<void()> target){
+            if (s.lifetime.is_stopped()) abort();
+            defer(s, make_observer(subscription{}, [target](auto& ){
                 return target();
             }));
         });
+#endif
     }
     context(subscription lifetime, make_strand_type m, strand_type s) 
         : lifetime(lifetime)
         , m(m)
         , s(make_state<State>(lifetime, s)) {
         lifetime.insert(this->s.get().s.lifetime);
-        auto& ref = this->s.get();
-        lifetime.bind_defer([&](function<void()> target){
-            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+#if !RX_DEFER_IMMEDIATE
+        lifetime.bind_defer([s = this->s.get().s](function<void()> target){
+            if (s.lifetime.is_stopped()) abort();
+            defer(s, make_observer(subscription{}, [target](auto& ){
                 return target();
             }));
         });
+#endif
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1188,12 +1295,14 @@ struct context<Payload, MakeStrand, Clock> {
         , m(m)
         , s(make_state<State>(lifetime, m(subscription{}), move(p))) {
         lifetime.insert(s.get().s.lifetime);
-        auto& ref = s.get();
-        lifetime.bind_defer([&](function<void()> target){
-            defer(ref.s, make_observer(subscription{}, [target](auto& ){
+#if !RX_DEFER_IMMEDIATE
+        lifetime.bind_defer([s = s.get().s](function<void()> target){
+            if (s.lifetime.is_stopped()) abort();
+            defer(s, make_observer(subscription{}, [target](auto& ){
                 return target();
             }));
         });
+#endif
     }
     time_point_t<clock_type> now() const {
         return s.get().s.now();
@@ -1706,42 +1815,45 @@ using not_terminator = not_specialization_of_t<T, terminator>;
 
 
 inline context<> start(subscription lifetime = subscription{}) {
-    info("start");
+    info("start default lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(lifetime.store.get())));
     return make_context(lifetime);
 }
 
 template<class Payload, class... AN>
 auto start(AN&&... an) {
-    info("start payload");
-    return make_context<Payload>(subscription{}, forward<AN>(an)...);
+    subscription lifetime;
+    info("start payload lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(lifetime.store.get())));
+    return make_context<Payload>(lifetime, forward<AN>(an)...);
 }
 
 template<class Payload, class... ArgN>
 auto start(subscription lifetime, ArgN&&... an) {
-    info("start liftime & payload");
+    info("start lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(lifetime.store.get())) + " & payload");
     return make_context<Payload>(lifetime, forward<ArgN>(an)...);
 }
 
 template<class Payload, class Clock, class... AN>
 auto start(AN&&... an) {
-    info("start clock & payload");
+    subscription lifetime;
+    info("start clock & payload lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(lifetime.store.get())));
     return make_context<Payload, Clock>(subscription{}, forward<AN>(an)...);
 }
 
 template<class Payload, class Clock, class... AN>
 auto start(subscription lifetime, AN&&... an) {
-    info("start liftime & clock & payload");
+    info("start lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(lifetime.store.get())) + " & clock & payload");
     return make_context<Payload, Clock>(lifetime, forward<AN>(an)...);
 }
 
 template<class Payload, class MakeStrand, class Clock>
 auto start(const context<Payload, MakeStrand, Clock>& o) {
-    info("start copy");
+    info("start copy lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(o.lifetime.store.get())));
     return o;
 }
 
 template<class... CN>
 auto start(subscription lifetime, const context<CN...>& o) {
+    info("start copy with new lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(lifetime.store.get())) + " old lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(lifetime.store.get())));
     return copy_context(lifetime, o);
 }
 
@@ -1794,7 +1906,7 @@ const auto intervals = [](auto makeStrand, auto initial, auto period){
             auto r = scrb.create(ctx);
             info("intervals started");
             defer_periodic(intervalcontext, initial, period, r);
-            return r.lifetime;
+            return ctx.lifetime;
         });
     });
 };
@@ -1812,7 +1924,7 @@ const auto ints = [](auto first, auto last){
                 if (i == last) break;
             }
             r.complete();
-            return r.lifetime;
+            return ctx.lifetime;
         });
     });
 };
@@ -1900,9 +2012,10 @@ const auto copy_if = [](auto pred){
     return make_lifter([=](auto scbr){
         info("copy_if bound to subscriber");
         return make_subscriber([=](auto ctx){
-            info("copy_if bound to context");
+            info("copy_if bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
             auto r = scbr.create(ctx);
-            return make_observer(r, ctx.lifetime, [=](auto& r, auto v){
+            info("copy_if observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(r.lifetime.store.get())));
+            return make_observer(r, r.lifetime, [=](auto& r, auto v){
                 if (pred(v)) r.next(v);
             });
         });
@@ -1914,9 +2027,10 @@ const auto transform = [](auto f){
     return make_lifter([=](auto scbr){
         info("transform bound to subscriber");
         return make_subscriber([=](auto ctx){
-            info("transform bound to context");
+            info("transform bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
             auto r = scbr.create(ctx);
-            return make_observer(r, ctx.lifetime, [=](auto& r, auto& v){
+            info("transform observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(r.lifetime.store.get())));
+            return make_observer(r, r.lifetime, [=](auto& r, auto& v){
                 r.next(f(v));
             });
         });
@@ -1928,10 +2042,11 @@ const auto finally = [](auto f){
     return make_lifter([=](auto scbr){
         info("finally bound to subscriber");
         return make_subscriber([=](auto ctx){
-            info("finally bound to context");
+            info("finally bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
             auto r = scbr.create(ctx);
             r.lifetime.insert(f);
-            return make_observer(r, ctx.lifetime);
+            info("finally observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(r.lifetime.store.get())));
+            return make_observer(r, r.lifetime);
         });
     });
 };
@@ -1941,14 +2056,15 @@ const auto last_or_default = [](auto def){
     return make_lifter([=](auto scbr){
         info("last_or_default bound to subscriber");
         return make_subscriber([=](auto ctx){
-            info("last_or_default bound to context");
+            info("last_or_default bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
             auto r = scbr.create(ctx);
             auto last = ctx.lifetime.template make_state<std::decay_t<decltype(def)>>(def);
-            return make_observer(r, ctx.lifetime, 
+            info("last_or_default observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(r.lifetime.store.get())));
+            return make_observer(r, r.lifetime,
                 [last](auto& , auto v){
                     last.get() = v;
                 },
-                detail::ignore{},
+                detail::skip{},
                 [last](auto& r){
                     r.next(last.get());
                     r.complete();
@@ -1965,10 +2081,11 @@ const auto take = [](int n){
             info("take bound to subscriber");
             return source.bind(
                 make_subscriber([=](auto ctx){
-                    info("take bound to context");
+                    info("take bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
                     auto r = scrb.create(ctx);
-                    auto remaining = ctx.lifetime.template make_state<int>(n);
-                    return make_observer(r, ctx.lifetime, 
+                    auto remaining = r.lifetime.template make_state<int>(n);
+                    info("take observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(r.lifetime.store.get())));
+                    return make_observer(r, r.lifetime,
                     [remaining](auto& r, auto v){
                         if (remaining.get()-- == 0) {
                             r.complete();
@@ -1992,44 +2109,45 @@ const auto merge = [](auto makeStrand){
             make_lifter([=](auto scrb) {
                 info("merge bound to subscriber");
                 return make_subscriber([=](auto ctx){
-                    info("merge bound to context");
+                    info("merge bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
                     
                     auto sourcecontext = make_context(subscription{}, sharedmakestrand);
 
                     auto pending = make_state<set<subscription>>(ctx.lifetime);
-                    pending.get().insert(sourcecontext.lifetime);
 
-                    ctx.lifetime.insert([pending](){
+                    auto& pends = pending.get();
+                    ctx.lifetime.insert([&pends](){
                         info("merge-output stopping all inputs");
                         // stop all the inputs
-                        for (auto l : pending.get()) {
+                        for (auto& l : pends) {
                             l.stop();
-                            l.join();
                         }
-                        pending.get().clear();
+                        pends.clear();
                         info("merge-output stop");
                     });
 
                     auto destctx = copy_context(ctx.lifetime, sharedmakestrand, ctx);
                     auto r = scrb.create(destctx);
 
-                    sourcecontext.lifetime.insert([pending, r, l = sourcecontext.lifetime](){
-                        pending.get().erase(l);
-                        if (pending.get().empty()){
+                    auto it = pending.get().insert(sourcecontext.lifetime).first;
+                    sourcecontext.lifetime.insert([=, &pends](){
+                        pends.erase(it);
+                        if (pends.empty()){
                             info("merge-input complete destination");
                             r.complete();
                         }
                         info("merge-input stop");
                     });
 
+                    info("merge-input observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(sourcecontext.lifetime.store.get())));
                     return make_observer(r, sourcecontext.lifetime, 
-                        [pending, sharedmakestrand](auto& r, auto& v){
+                        [=, &pends](auto& r, auto& v){
                             info("merge-nested start");
                             auto nestedcontext = make_context(subscription{}, sharedmakestrand);
-                            pending.get().insert(nestedcontext.lifetime);
-                            nestedcontext.lifetime.insert([pending, r, l = nestedcontext.lifetime](){
-                                pending.get().erase(l);
-                                if (pending.get().empty()){
+                            auto it = pends.insert(nestedcontext.lifetime).first;
+                            nestedcontext.lifetime.insert([=, &pends](){
+                                pends.erase(it);
+                                if (pends.empty()){
                                     info("merge-nested complete destination");
                                     r.complete();
                                 }
@@ -2038,7 +2156,8 @@ const auto merge = [](auto makeStrand){
                             v |
                                 observe_on(sharedmakestrand) |
                                 make_subscriber([=](auto ctx){
-                                    info("merge-nested bound to context");
+                                    info("merge-nested bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
+                                    info("merge-nested observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
                                     return make_observer(r, ctx.lifetime, 
                                         [](auto& r, auto& v){
                                             r.next(v);
@@ -2059,8 +2178,9 @@ auto transform_merge(MakeStrand&& makeStrand, F&& f) {
 const auto printto = [](auto& output){
     info("new printto");
     return make_subscriber([&](auto ctx) {
-        info("printto bound to context");
+        ::info("printto bound to context lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
         auto values = ctx.lifetime.template make_state<int>(0);
+        ::info("printto observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(ctx.lifetime.store.get())));
         return make_observer(
             ctx.lifetime,
             [=, &output](auto v) {
@@ -2318,10 +2438,11 @@ struct run_loop {
     explicit run_loop(subscription l) 
         : lifetime(l)
         , loop(make_state<guarded_loop>(lifetime)) {
-        lifetime.insert([loop = this->loop](){
-            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: stop notify_all");
-            guard_type guard(loop.get().lock);
-            loop.get().wake.notify_all();
+        auto& guarded = this->loop.get();
+        lifetime.insert([&guarded](){
+            info(to_string(reinterpret_cast<ptrdiff_t>(addressof(guarded))) + " - run_loop: stop notify_all");
+            //guard_type guard(guarded.lock);
+            guarded.wake.notify_all();
         });
     }
     ~run_loop(){
@@ -2423,7 +2544,6 @@ struct run_loop {
         void operator()(time_point<clock_type> at, observer<OON...> out) const {
             guard_type guard(loop.get().lock);
             lifetime.insert(out.lifetime);
-            out.lifetime.insert([lifetime = this->lifetime, l = out.lifetime](){lifetime.erase(l);});
             loop.get().deferred.push(item_type{at, out});
             info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: defer_at notify_all");
             loop.get().wake.notify_all();
@@ -2481,7 +2601,15 @@ struct make_new_thread {
         info("new_thread: create");
         run_loop<Clock, Error> loop(subscription{});
         auto strand = loop.make()(lifetime);
-        auto t = make_state<threadjoin>(lifetime, [=](){loop.run();}, [l = loop.lifetime](){l.stop(); l.join();});
+        auto t = make_state<threadjoin>(lifetime, [=](){
+                info("new_thread: loop run enter");
+                loop.run();
+                info("new_thread: loop run exit");
+            }, [l = loop.lifetime](){
+                info("new_thread: loop stop enter");
+                l.stop();
+                info("new_thread: loop stop exit");
+            });
         return make_strand<Clock>(lifetime, new_thread<decltype(strand)>(move(strand), move(t)), detail::now<Clock>{});
     }
 };
@@ -2521,7 +2649,7 @@ auto strand = makeStrand(subscription{});
 
 strand.now();
 
-#if 1
+#if !RX_SKIP_TESTS
 {
     auto defer_lifetime = subscription{};
     make_state<shared_ptr<destruction>>(defer_lifetime, make_shared<destruction>());
@@ -2575,8 +2703,7 @@ auto makeThread = make_shared_make_strand(make_new_thread<>{});
 
 auto thread = makeThread(subscription{});
 
-#if 1
-
+#if !RX_SKIP_TESTS
 {
     auto defer_lifetime = subscription{};
     make_state<shared_ptr<destruction>>(defer_lifetime, make_shared<destruction>());
@@ -2588,7 +2715,7 @@ this_thread::sleep_for(1s);
 cout << endl;
 #endif
 
-#if 1
+#if !RX_SKIP_TESTS
 {
     auto defer_lifetime = subscription{};
     make_state<shared_ptr<destruction>>(defer_lifetime, make_shared<destruction>());
@@ -2603,7 +2730,7 @@ this_thread::sleep_for(2s);
 cout << endl;
 #endif
 
-#if 1
+#if !RX_SKIP_TESTS
 {
     auto c = make_context<steady_clock>(subscription{}, makeThread);
     auto defer_lifetime = subscription{};
@@ -2619,7 +2746,24 @@ this_thread::sleep_for(2s);
 cout << endl;
 #endif
 
-#if 1
+#if !RX_SKIP_TESTS
+{
+    auto f = make_context<steady_clock>(subscription{}, makeThread);
+    auto c = copy_context(subscription{}, makeThread, f);
+    auto defer_lifetime = subscription{};
+    make_state<shared_ptr<destruction>>(defer_lifetime, make_shared<destruction>());
+    defer_periodic(c, c.now(), 1s, make_observer(defer_lifetime, [=](long c){
+        cout << this_thread::get_id() << " - deferred thread copied context periodic - " << c << endl;
+        if (c > 2) {
+            defer_lifetime.stop();
+        }
+    })).join();
+}
+this_thread::sleep_for(2s);
+cout << endl;
+#endif
+
+#if !RX_SKIP_TESTS
 {
  cout << "intervals" << endl;
     auto threeeven = copy_if(even) | 
@@ -2638,17 +2782,27 @@ this_thread::sleep_for(2s);
 cout << endl;
 #endif
 
-#if 1
+#if !RX_SKIP_TESTS
 {
- cout << "merged multi-thread intervals" << endl;
+ output("merged multi-thread intervals");
 
-    // intervals(makeThread, steady_clock::now() + 1s, 1s) | 
-    //     take(5) |
-    //     transform_merge(makeThread, twointervals) |
-    ints(1, 5) |
-        transform_merge(make_new_thread<>{}, twointervals) |
+    intervals(make_new_thread<>{}, steady_clock::now(), 20ms) | 
+        take(thread::hardware_concurrency()) |
+        transform_merge(make_new_thread<>{}, [](long c){
+            output("thread started");
+            return intervals(make_new_thread<>{}, steady_clock::now(), 1ms) |
+                take(5001) |
+                transform([=](long n){
+                    auto r = (c * 10000) + n;
+                    return r;
+                }) |
+                as_interface<long>() |
+                last_or_default(42) |
+                finally([](){output("thread stopped");});
+        }) |
         as_interface<long>() |
-        finally([](){cout << "caller stopped" << endl;}) |
+        finally([](){output("caller stopped");}) |
+        as_interface<long>() |
         printto(cout) |
         start<shared_ptr<destruction>>(subscription{}, make_shared<destruction>()) |
         join();
@@ -2657,7 +2811,7 @@ this_thread::sleep_for(2s);
 cout << endl;
 #endif
 
-#if !RX_INFO
+#if !RX_INFO && !RX_SKIP_TESTS
 
 {
  cout << "compile-time polymorphism" << endl;
@@ -2706,6 +2860,33 @@ cout << endl;
             printto(cout) |
             as_interface<>() |
             start();
+
+ auto t1 = high_resolution_clock::now();
+ auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
+ auto sc = ((last * 100) - first) * 3;
+ cout << d / sc << " ms per value\n"; 
+ auto s = d / 1000.0;
+ cout << sc / s << " values per second\n"; 
+}
+
+{
+ cout << "new thread" << endl;
+    auto lastofeven = copy_if(even) | 
+        take(100000000) |
+        last_or_default(42);
+
+ auto t0 = high_resolution_clock::now();
+    ints(0, 2) | 
+        observe_on(make_new_thread<>{}) |
+        transform_merge(make_new_thread<>{}, [=](int){
+            return ints(first, last * 100) |
+                observe_on(make_new_thread<>{}) |
+                lastofeven;
+        }) |
+        as_interface<long>() |
+        printto(cout) |
+        start() |
+        join();
 
  auto t1 = high_resolution_clock::now();
  auto d = duration_cast<milliseconds>(t1-t0).count() * 1.0;
