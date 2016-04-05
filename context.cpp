@@ -97,6 +97,7 @@ struct destruction
 
 #include "common.h"
 #include "rx.h"
+#include "designcontext.h"
 
 int main() {
     //emscripten_set_main_loop(tick, -1, false);
