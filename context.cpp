@@ -1,9 +1,9 @@
 
 // source ~/source/emsdk_portable/emsdk_env.sh
 
-// em++ -std=c++14 --memory-init-file 0 -s ASSERTIONS=2 -s DEMANGLE_SUPPORT=1 -s DISABLE_EXCEPTION_CATCHING=0 -s EXPORTED_FUNCTIONS="['_main', '_reset', '_designcontext']" -Iexecutors/include -DRX_INFO=0 -DRX_SLOW=0 -O2 context.cpp -o context.js
+// em++ -std=c++14 --memory-init-file 0 -s ASSERTIONS=2 -s DEMANGLE_SUPPORT=1 -s DISABLE_EXCEPTION_CATCHING=0 -s EXPORTED_FUNCTIONS="['_main', '_reset', '_designcontext']" -Iexecutors/include -DRX_INFO=0 -DRX_SKIP_TESTS=0 -DRX_SLOW=0 -DRX_DEFER_IMMEDIATE=0 -O2 context.cpp -o context.js
 
-// c++ -std=c++14 -DRX_INFO=0 -DRX_SLOW=0 -O2 context.cpp -o context
+// c++ -std=c++14 -DRX_INFO=0 -DRX_SKIP_TESTS=0 -DRX_SLOW=0 -DRX_DEFER_IMMEDIATE=0 -O2 context.cpp -o context
 
 #if EMSCRIPTEN
 #include <emscripten.h>
