@@ -1,9 +1,9 @@
 
 // source ~/source/emsdk_portable/emsdk_env.sh
 
-// em++ -std=c++14 --memory-init-file 0 -s ASSERTIONS=2 -s DEMANGLE_SUPPORT=1 -s DISABLE_EXCEPTION_CATCHING=0 -s EXPORTED_FUNCTIONS="['_main', '_reset', '_designcontext']" -Iexecutors/include -DRX_INFO=0 -DRX_SKIP_TESTS=0 -DRX_SLOW=0 -DRX_DEFER_IMMEDIATE=0 -O2 context.cpp -o context.js
+// em++ -std=c++14 --memory-init-file 0 -s ASSERTIONS=2 -s DEMANGLE_SUPPORT=1 -s DISABLE_EXCEPTION_CATCHING=0 -s NO_EXIT_RUNTIME=1 -s AGGRESSIVE_VARIABLE_ELIMINATION=1 -s EXPORT_NAME="'ContextLib'" -s MODULARIZE=1 -DRX_INFO=0 -DRX_SKIP_TESTS=0 -DRX_SKIP_THREAD=1 -DRX_SLOW=0 -DRX_DEFER_IMMEDIATE=0 -O2 -g4 context.cpp -o context.js
 
-// c++ -std=c++14 -DRX_INFO=0 -DRX_SKIP_TESTS=0 -DRX_SLOW=0 -DRX_DEFER_IMMEDIATE=0 -O2 context.cpp -o context
+// c++ -std=c++14 -DRX_INFO=0 -DRX_SKIP_TESTS=0 -DRX_SKIP_THREAD=0 -DRX_SLOW=0 -DRX_DEFER_IMMEDIATE=0 -O2 context.cpp -o context
 
 #if EMSCRIPTEN
 #include <emscripten.h>
@@ -40,7 +40,7 @@ inline string what(exception_ptr ep) {
 namespace detail {
 
 mutex infolock;
-const auto start = steady_clock::now();
+auto start = steady_clock::now();
 
 void info(){
     cout << endl;
@@ -57,7 +57,7 @@ void info(A0 a0, AN... an){
 const auto info = [](auto... an){
 #if RX_INFO
     unique_lock<mutex> guard(detail::infolock);
-    cout << this_thread::get_id() << " - " << duration_cast<milliseconds>(steady_clock::now() - detail::start).count() << "ms - ";
+    cout << this_thread::get_id() << " - " << fixed << setprecision(1) << setw(4) << duration_cast<milliseconds>(steady_clock::now() - detail::start).count()/1000.0 << "s - ";
     detail::info(an...);
 #else
     make_tuple(an...);
@@ -68,7 +68,7 @@ const auto output = [](auto... an){
 #if RX_INFO
     unique_lock<mutex> guard(detail::infolock);
 #endif
-    cout << this_thread::get_id() << " - " << duration_cast<milliseconds>(steady_clock::now() - detail::start).count() << "ms - ";
+    cout << this_thread::get_id() << " - " << fixed << setprecision(1) << setw(4) << duration_cast<milliseconds>(steady_clock::now() - detail::start).count()/1000.0 << "s - ";
     detail::info(an...);
 };
 
@@ -95,16 +95,27 @@ struct destruction
     destruction() : track(make_shared<Track>()) {}
 };
 
-#include "common.h"
 #include "rx.h"
+#include "common.h"
 #include "designcontext.h"
 
-int main() {
-    //emscripten_set_main_loop(tick, -1, false);
-    designcontext(0, 10000);
-    output("main sleep");
-    this_thread::sleep_for(2s);
-    output("main exit");
+#if EMSCRIPTEN
+
+int EMSCRIPTEN_KEEPALIVE main() {
+
+    emscripten_set_main_loop(tick, -1, false);
+
     return 0;
 }
+
+#else
+
+int main() {
+    designcontext(0, 100);
+    loop.run();
+
+    return 0;
+}
+
+#endif
 

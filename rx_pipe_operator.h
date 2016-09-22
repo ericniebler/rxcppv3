@@ -24,6 +24,21 @@ auto operator|(lifter<LLN...> lhs, lifter<LRN...> rhs) {
     });
 }
 
+namespace detail {
+
+template<typename O, typename L>
+struct o_l
+{
+    mutable O o;
+    mutable L l;
+    template<typename SCRB>
+    auto operator()(SCRB scrb) const -> decltype(o.bind(l.lift(scrb))) {
+        return o.bind(l.lift(scrb));
+    }
+};
+
+}
+
 /// \brief chain operator overload for
 /// Observable = Observable | Lifter
 /// \param observable
@@ -31,9 +46,7 @@ auto operator|(lifter<LLN...> lhs, lifter<LRN...> rhs) {
 /// \returns observable
 template<class... ON, class... LN>
 auto operator|(observable<ON...> s, lifter<LN...> l) {
-    return make_observable([=](auto scrb){
-        return s.bind(l.lift(scrb));
-    });
+    return make_observable(detail::o_l<observable<ON...>, lifter<LN...>>{s, l});
 }
 
 
@@ -84,6 +97,32 @@ auto operator|(adaptor<AN...> a, lifter<LN...> l) {
     });
 }
 
+namespace detail {
+
+template<typename L, typename S>
+struct l_s
+{
+    mutable L l;
+    mutable S source;
+    template<typename SCRB>
+    auto operator()(SCRB scrb) const -> decltype(source.bind(l.lift(scrb))) {
+        return source.bind(l.lift(scrb));
+    }
+};
+
+template<typename L, typename A>
+struct l_a
+{
+    mutable L l;
+    mutable A a;
+    template<typename S>
+    auto operator()(S source) const -> decltype(a.adapt(make_observable(l_s<L, S>{l, source}))) {
+        return a.adapt(make_observable(l_s<L, S>{l, source}));
+    }
+};
+
+}
+
 /// \brief chain operator overload for
 /// Adaptor = Lifter | Adaptor
 /// \param lifter
@@ -91,11 +130,7 @@ auto operator|(adaptor<AN...> a, lifter<LN...> l) {
 /// \returns adaptor
 template<class... LN, class... AN>
 auto operator|(lifter<LN...> l, adaptor<AN...> a) {
-    return make_adaptor([=](auto source){
-        return a.adapt(make_observable([=](auto scrb){
-            return source.bind(l.lift(scrb));
-        }));
-    });
+    return make_adaptor(detail::l_a<lifter<LN...>, adaptor<AN...>>{l, a});
 }
 
 /// \brief chain operator overload for

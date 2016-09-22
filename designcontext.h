@@ -1,8 +1,5 @@
 #pragma once 
 
-extern"C" {
-    void designcontext(int, int);
-}
 
 ///
 /// demonstrate "async-tuple"
@@ -35,6 +32,140 @@ const auto text = [](){
 
 }
 
+#if EMSCRIPTEN
+
+extern"C" void EMSCRIPTEN_KEEPALIVE intervalsv3(){
+
+using namespace std::chrono;
+
+using namespace rx;
+using rx::copy_if;
+using rx::transform;
+using rx::merge;
+
+    auto threeeven = copy_if(even) | 
+        take(3) |
+        delay(makeStrand, 1s);
+
+    auto l = intervals(makeStrand, steady_clock::now(), 1s) | 
+        threeeven |
+        as_interface<long>() |
+        finally([](){cout << "caller stopped" << endl;}) |
+        printto(cout) |
+        start<destruction>(subscription{}, destruction{});
+
+    lifetime.insert(l);
+}
+
+extern"C" void EMSCRIPTEN_KEEPALIVE pushv3(int first, int last){
+
+using namespace std::chrono;
+
+using namespace rx;
+using rx::copy_if;
+using rx::transform;
+using rx::merge;
+
+    auto l = async_ints(makeStrand, first, last) | 
+        copy_if(even) | 
+        printto(cout) |
+        start<destruction>(subscription{}, destruction{});
+
+    lifetime.insert(l);
+}
+
+extern"C" void EMSCRIPTEN_KEEPALIVE lastv3(int first, int last, int defaultValue){
+
+using namespace std::chrono;
+
+using namespace rx;
+using rx::copy_if;
+using rx::transform;
+using rx::merge;
+
+    auto l = async_ints(makeStrand, first, last) | 
+        copy_if(even) | 
+        last_or_default(defaultValue) |
+        printto(cout) |
+        start<destruction>(subscription{}, destruction{});
+
+    lifetime.insert(l);
+}
+
+extern"C" void EMSCRIPTEN_KEEPALIVE takev3(int first, int last, int count){
+
+using namespace std::chrono;
+
+using namespace rx;
+using rx::copy_if;
+using rx::transform;
+using rx::merge;
+
+    auto l = async_ints(makeStrand, first, last) | 
+        copy_if(even) | 
+        take(count) |
+        printto(cout) |
+        start<destruction>(subscription{}, destruction{});
+
+    lifetime.insert(l);
+}
+
+extern"C" void EMSCRIPTEN_KEEPALIVE errorv3(int first, int last, int count){
+
+using namespace std::chrono;
+
+using namespace rx;
+using rx::copy_if;
+using rx::transform;
+using rx::merge;
+
+    auto l = async_ints(makeStrand, first, last) | 
+        copy_if(always_throw) | 
+        take(count) |
+        printto(cout) |
+        start<destruction>(subscription{}, destruction{});
+
+    lifetime.insert(l);
+}
+
+extern"C" void EMSCRIPTEN_KEEPALIVE delayv3(int producems, int delayms, int count){
+
+using namespace std::chrono;
+
+using namespace rx;
+using rx::copy_if;
+using rx::transform;
+using rx::merge;
+
+    const auto printproduced = [](auto& output){
+        return make_lifter([&output](auto scbr){
+            return make_subscriber([=, &output](auto ctx){
+                auto r = scbr.create(ctx);
+                auto start = ctx.now();
+                return make_observer(r, r.lifetime, [=, &output](auto& r, auto v){
+                    defer(ctx, make_observer(subscription{}, [=, &output](auto& ){
+                        output << this_thread::get_id() << " - " << fixed << setprecision(1) << setw(4) << duration_cast<milliseconds>(ctx.now() - start).count()/1000.0 << "s - " << v << " produced" << endl;
+                    }));
+                    r.next(v);
+                });
+            });
+        });
+    };
+
+    auto l = intervals(makeStrand, steady_clock::now() + milliseconds(producems), milliseconds(producems)) | 
+        printproduced(cout) |
+        delay(makeStrand, milliseconds(delayms)) |
+        take(count) |
+        printto(cout) |
+        start<destruction>(subscription{}, destruction{});
+
+    lifetime.insert(l);
+}
+
+#endif
+
+#if !EMSCRIPTEN
+
 void designcontext(int first, int last){
 
 using namespace std::chrono;
@@ -47,7 +178,7 @@ using rx::merge;
 // silence compiler
 [](int, int) {} (first, last);
 
-auto makeStrand = rx::detail::make_immediate<>{};
+//auto makeStrand = rx::detail::make_immediate<>{};
 
 auto strand = makeStrand(subscription{});
 
@@ -109,6 +240,8 @@ auto sharedmakestrand = make_shared_make_strand(makeStrand);
         make_subscriber([](auto ctx) {return make_observer(ctx.lifetime, cstr_or_string{});}) |
         start();
 }
+
+#if !RX_SKIP_THREAD
 
 auto makeThread = make_shared_make_strand(make_new_thread<>{});
 
@@ -222,6 +355,8 @@ this_thread::sleep_for(2s);
 cout << endl;
 #endif
 
+#endif 
+
 #if !RX_INFO && !RX_SKIP_TESTS
 
 {
@@ -280,6 +415,8 @@ cout << endl;
  cout << sc / s << " values per second\n"; 
 }
 
+#if !RX_SKIP_THREAD
+
 {
  cout << "new thread" << endl;
     auto lastofeven = copy_if(even) | 
@@ -306,6 +443,8 @@ cout << endl;
  auto s = d / 1000.0;
  cout << sc / s << " values per second\n"; 
 }
+
+#endif
 
 {
  cout << "for" << endl;
@@ -386,6 +525,8 @@ cout << endl;
  cout << sc / s << " subscriptions per second\n"; 
 }
 
+#if !RX_SKIP_THREAD
+
 {
  cout << "transform_merge new_thread" << endl;
  auto t0 = high_resolution_clock::now();
@@ -419,4 +560,6 @@ cout << endl;
 
 #endif
 
+#endif
 }
+#endif

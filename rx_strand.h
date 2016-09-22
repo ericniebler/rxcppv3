@@ -7,6 +7,8 @@ template<class Select = defaults, class... TN>
 struct strand;
 
 namespace detail {
+    struct shared_strand_construct_t {};
+
     template<class C>
     using re_defer_at_t = function<void(time_point_t<C>)>;
 
@@ -125,7 +127,7 @@ template<class Strand>
 struct shared_strand {
     using strand_type = decay_t<Strand>;
     template<class F>
-    explicit shared_strand(F&& f) : st(forward<F>(f)) {}
+    explicit shared_strand(F&& f, detail::shared_strand_construct_t&&) : st(forward<F>(f)) {}
     strand_type st;
     ~shared_strand() {
         info("shared_strand: destroy stop");
@@ -150,9 +152,9 @@ struct shared_strand_maker {
 
 
 template<class Strand>
-shared_strand_maker<Strand> make_shared_strand_maker(Strand&& s){
+auto make_shared_strand_maker(Strand&& s) -> shared_strand_maker<decay_t<Strand>> {
     using strand_type = decay_t<Strand>;
-    return {make_shared<shared_strand<strand_type>>(forward<Strand>(s))};
+    return shared_strand_maker<strand_type>{make_shared<shared_strand<strand_type>>(forward<Strand>(s), detail::shared_strand_construct_t{})};
 }
 
 template<class MakeStrand>

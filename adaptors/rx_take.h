@@ -14,14 +14,17 @@ const auto take = [](int n){
                     auto r = scrb.create(ctx);
                     auto remaining = make_state<int>(r.lifetime, n);
                     info("take observer lifetime - " + to_string(reinterpret_cast<ptrdiff_t>(r.lifetime.store.get())));
-                    return make_observer(r, r.lifetime,
-                    [remaining](auto& r, auto v){
-                        if (remaining.get()-- == 0) {
-                            r.complete();
-                            return;
-                        }
-                        r.next(v);
-                    });
+                    auto lifted = make_observer(r, r.lifetime,
+                        [remaining](auto& r, auto v){
+                            r.next(v);
+                            if (--remaining.get() == 0) {
+                                r.complete();
+                            }
+                        });
+                    if (n == 0) {
+                        lifted.complete();
+                    }
+                    return lifted;
                 }));
         });
     });

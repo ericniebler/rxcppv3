@@ -98,13 +98,14 @@ struct run_loop {
         }
     }
 
-    void step(guard_type& guard) const {
+    void step(guard_type& guard, typename clock_type::duration d) const {
         if (!guard.owns_lock()) { 
             info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: step caller must own lock!");
             abort(); 
         }
         auto& deferred = loop.get().deferred;
-        while (!loop.lifetime.is_stopped() && is_ready(guard)) {
+        auto stop = clock_type::now() + d;
+        while (!loop.lifetime.is_stopped() && is_ready(guard) && clock_type::now() < stop) {
             info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: step");
 
             auto next = move(deferred.top());
@@ -120,7 +121,7 @@ struct run_loop {
         guard_type guard(loop.get().lock);
         info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: run");
         while (wait(guard)) {
-            step(guard);
+            step(guard, 3600s);
         }
         info(to_string(reinterpret_cast<ptrdiff_t>(addressof(loop.get()))) + " - run_loop: exit");
     }
@@ -141,7 +142,7 @@ struct run_loop {
 
     auto make() const {
         return [loop = this->loop](subscription lifetime) {
-            lifetime.insert(loop.lifetime);
+            loop.lifetime.insert(lifetime);
             return make_strand<clock_type>(lifetime, strand{lifetime, loop}, detail::now<clock_type>{});
         };
     }
